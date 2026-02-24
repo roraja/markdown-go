@@ -269,6 +269,14 @@ const indexHTML = `<!DOCTYPE html>
       min-height: 100vh;
     }
 
+    .app.sidebar-hidden {
+      grid-template-columns: minmax(0, 1fr);
+    }
+
+    .app.sidebar-hidden .sidebar {
+      display: none;
+    }
+
     .sidebar {
       border-right: 1px solid var(--border);
       background: var(--sidebar-bg);
@@ -293,26 +301,82 @@ const indexHTML = `<!DOCTYPE html>
       margin-top: 14px;
       display: flex;
       flex-direction: column;
-      gap: 4px;
+      gap: 0;
+      user-select: none;
     }
 
-    .file-item {
+    .tree-item {
+      display: flex;
+      align-items: center;
       width: 100%;
-      border: 1px solid transparent;
+      border: none;
       background: transparent;
       color: var(--text);
       text-align: left;
-      padding: 8px 10px;
-      border-radius: 6px;
+      padding: 3px 0;
+      padding-right: 8px;
       cursor: pointer;
       font-size: 13px;
-      word-break: break-word;
+      font-family: inherit;
+      line-height: 22px;
+      height: 22px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      border-radius: 0;
     }
 
-    .file-item:hover { background: var(--panel); }
-    .file-item.active {
-      border-color: #1f6feb99;
+    .tree-item:hover { background: var(--panel); }
+    .tree-item.active {
       background: var(--active);
+    }
+
+    .tree-chevron {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 16px;
+      min-width: 16px;
+      height: 22px;
+      font-size: 10px;
+      color: var(--muted);
+      transition: transform 0.1s ease;
+    }
+
+    .tree-chevron.expanded {
+      transform: rotate(90deg);
+    }
+
+    .tree-chevron.placeholder {
+      visibility: hidden;
+    }
+
+    .tree-icon {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 16px;
+      min-width: 16px;
+      height: 22px;
+      margin-right: 4px;
+      font-size: 14px;
+    }
+
+    .tree-icon.folder-icon { color: #e8a64e; }
+    .tree-icon.file-icon { color: var(--muted); }
+
+    .tree-label {
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .tree-children {
+      display: flex;
+      flex-direction: column;
+    }
+
+    .tree-children.collapsed {
+      display: none;
     }
 
     .main {
@@ -459,6 +523,7 @@ const indexHTML = `<!DOCTYPE html>
           <div class="muted">GitHub-like markdown preview with Mermaid support</div>
         </div>
         <div class="header-actions">
+          <button id="toggle-sidebar-btn" class="btn" type="button">Hide Sidebar</button>
           <button id="theme-toggle-btn" class="btn" type="button">Light Mode</button>
           <button id="toggle-raw-btn" class="btn hidden" type="button">Show Raw</button>
         </div>
@@ -476,11 +541,13 @@ const indexHTML = `<!DOCTYPE html>
 
   <script>
     const INITIAL_FILE = {{ printf "%q" .InitialFile }};
+    const appEl = document.querySelector('.app');
     const fileListEl = document.getElementById('file-list');
     const fileNameEl = document.getElementById('file-name');
     const renderedEl = document.getElementById('rendered-content');
     const rawContainerEl = document.getElementById('raw-content');
     const rawCodeEl = document.getElementById('raw-code');
+    const toggleSidebarBtn = document.getElementById('toggle-sidebar-btn');
     const themeToggleBtn = document.getElementById('theme-toggle-btn');
     const toggleRawBtn = document.getElementById('toggle-raw-btn');
     const STORAGE_THEME_KEY = 'mdviewer-theme';
@@ -489,12 +556,17 @@ const indexHTML = `<!DOCTYPE html>
     let activeFile = '';
     let rawContent = '';
     let showingRaw = false;
+    let sidebarHidden = false;
 
     if (window.mermaid) {
       window.mermaid.initialize({ startOnLoad: false, securityLevel: 'loose', theme: 'neutral' });
     }
 
     loadThemePreference();
+
+    toggleSidebarBtn.addEventListener('click', () => {
+      applySidebarVisibility(!sidebarHidden, true);
+    });
 
     themeToggleBtn.addEventListener('click', () => {
       const currentTheme = document.documentElement.getAttribute('data-theme') === 'light' ? 'light' : 'dark';
@@ -511,7 +583,9 @@ const indexHTML = `<!DOCTYPE html>
     });
 
     window.addEventListener('popstate', () => {
-      const candidate = new URLSearchParams(window.location.search).get('file');
+      const params = new URLSearchParams(window.location.search);
+      applySidebarVisibility(isFullscreenMode(params), false);
+      const candidate = params.get('file');
       if (candidate && files.includes(candidate)) {
         openFile(candidate, false);
       }
@@ -527,7 +601,9 @@ const indexHTML = `<!DOCTYPE html>
         files = payload.files || [];
         renderFileList();
 
-        const requested = new URLSearchParams(window.location.search).get('file') || INITIAL_FILE;
+        const params = new URLSearchParams(window.location.search);
+        applySidebarVisibility(isFullscreenMode(params), false);
+        const requested = params.get('file') || INITIAL_FILE;
         if (requested && files.includes(requested)) {
           await openFile(requested, false);
         } else if (files.length > 0) {
@@ -540,22 +616,100 @@ const indexHTML = `<!DOCTYPE html>
       }
     }
 
+    function buildTree(filePaths) {
+      const root = { name: '', children: {}, files: [] };
+      for (const fp of filePaths) {
+        const parts = fp.split('/');
+        let node = root;
+        for (let i = 0; i < parts.length - 1; i++) {
+          const dir = parts[i];
+          if (!node.children[dir]) {
+            node.children[dir] = { name: dir, children: {}, files: [] };
+          }
+          node = node.children[dir];
+        }
+        node.files.push({ name: parts[parts.length - 1], path: fp });
+      }
+      return root;
+    }
+
+    function renderTreeNode(node, depth, container) {
+      const sortedDirs = Object.keys(node.children).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+      const sortedFiles = node.files.slice().sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
+
+      for (const dirName of sortedDirs) {
+        const child = node.children[dirName];
+        const folderBtn = document.createElement('button');
+        folderBtn.className = 'tree-item';
+        folderBtn.type = 'button';
+        folderBtn.style.paddingLeft = (depth * 16) + 'px';
+
+        const chevron = document.createElement('span');
+        chevron.className = 'tree-chevron expanded';
+        chevron.innerHTML = '&#9654;';
+
+        const icon = document.createElement('span');
+        icon.className = 'tree-icon folder-icon';
+        icon.innerHTML = '&#128193;';
+
+        const label = document.createElement('span');
+        label.className = 'tree-label';
+        label.textContent = dirName;
+
+        folderBtn.appendChild(chevron);
+        folderBtn.appendChild(icon);
+        folderBtn.appendChild(label);
+        container.appendChild(folderBtn);
+
+        const childContainer = document.createElement('div');
+        childContainer.className = 'tree-children';
+        container.appendChild(childContainer);
+
+        folderBtn.addEventListener('click', () => {
+          const isCollapsed = childContainer.classList.toggle('collapsed');
+          chevron.classList.toggle('expanded', !isCollapsed);
+          icon.innerHTML = isCollapsed ? '&#128194;' : '&#128193;';
+        });
+
+        renderTreeNode(child, depth + 1, childContainer);
+      }
+
+      for (const file of sortedFiles) {
+        const btn = document.createElement('button');
+        btn.className = 'tree-item';
+        btn.type = 'button';
+        btn.dataset.path = file.path;
+        btn.style.paddingLeft = (depth * 16) + 'px';
+
+        const chevronPlaceholder = document.createElement('span');
+        chevronPlaceholder.className = 'tree-chevron placeholder';
+
+        const icon = document.createElement('span');
+        icon.className = 'tree-icon file-icon';
+        icon.innerHTML = '&#128462;';
+
+        const label = document.createElement('span');
+        label.className = 'tree-label';
+        label.textContent = file.name;
+        label.title = file.path;
+
+        btn.appendChild(chevronPlaceholder);
+        btn.appendChild(icon);
+        btn.appendChild(label);
+        btn.addEventListener('click', () => openFile(file.path, true));
+        container.appendChild(btn);
+      }
+    }
+
     function renderFileList() {
       fileListEl.innerHTML = '';
-      for (const file of files) {
-        const btn = document.createElement('button');
-        btn.className = 'file-item';
-        btn.type = 'button';
-        btn.textContent = file;
-        btn.dataset.path = file;
-        btn.addEventListener('click', () => openFile(file, true));
-        fileListEl.appendChild(btn);
-      }
+      const tree = buildTree(files);
+      renderTreeNode(tree, 0, fileListEl);
       highlightActiveFile();
     }
 
     function highlightActiveFile() {
-      for (const item of fileListEl.querySelectorAll('.file-item')) {
+      for (const item of fileListEl.querySelectorAll('.tree-item[data-path]')) {
         item.classList.toggle('active', item.dataset.path === activeFile);
       }
     }
@@ -578,7 +732,14 @@ const indexHTML = `<!DOCTYPE html>
         if (pushState) {
           const url = new URL(window.location.href);
           url.searchParams.set('file', activeFile);
-          window.history.pushState({ file: activeFile }, '', url);
+          if (sidebarHidden) {
+            url.searchParams.set('fullscreen', '1');
+            url.searchParams.delete('sidebar');
+          } else {
+            url.searchParams.delete('fullscreen');
+            url.searchParams.delete('sidebar');
+          }
+          window.history.pushState({ file: activeFile, fullscreen: sidebarHidden }, '', url);
         }
       } catch (err) {
         renderedEl.innerHTML = '<div class="muted">Failed to load markdown file.</div>';
@@ -606,13 +767,46 @@ const indexHTML = `<!DOCTYPE html>
 
     function loadThemePreference() {
       const storedTheme = window.localStorage.getItem(STORAGE_THEME_KEY);
-      applyTheme(storedTheme === 'light' ? 'light' : 'dark');
+      applyTheme(storedTheme === 'dark' ? 'dark' : 'light');
     }
 
     function applyTheme(theme) {
       const resolvedTheme = theme === 'light' ? 'light' : 'dark';
       document.documentElement.setAttribute('data-theme', resolvedTheme);
       themeToggleBtn.textContent = resolvedTheme === 'dark' ? 'Light Mode' : 'Dark Mode';
+    }
+
+    function isFullscreenMode(params) {
+      const fullscreen = (params.get('fullscreen') || '').toLowerCase();
+      if (fullscreen === '1' || fullscreen === 'true' || fullscreen === 'yes') {
+        return true;
+      }
+
+      const sidebar = (params.get('sidebar') || '').toLowerCase();
+      return sidebar === 'hidden' || sidebar === '0' || sidebar === 'false';
+    }
+
+    function applySidebarVisibility(hidden, pushState) {
+      sidebarHidden = Boolean(hidden);
+      appEl.classList.toggle('sidebar-hidden', sidebarHidden);
+      toggleSidebarBtn.textContent = sidebarHidden ? 'Show Sidebar' : 'Hide Sidebar';
+
+      if (!pushState) {
+        return;
+      }
+
+      const url = new URL(window.location.href);
+      if (activeFile) {
+        url.searchParams.set('file', activeFile);
+      }
+      if (sidebarHidden) {
+        url.searchParams.set('fullscreen', '1');
+        url.searchParams.delete('sidebar');
+      } else {
+        url.searchParams.delete('fullscreen');
+        url.searchParams.delete('sidebar');
+      }
+      window.history.pushState({ file: activeFile, fullscreen: sidebarHidden }, '', url);
     }
 
     function decodeHTML(text) {

@@ -71,7 +71,7 @@ Then run the installed binary from your Go bin directory (for example `$(go env 
 1. Start the server with `go run .` or the built/installed binary.
 2. Open `http://localhost:8080` in your browser.
 3. Select a Markdown file from the left sidebar.
-4. Read the rendered view or toggle to **Show Raw**.
+4. Use **Hide Sidebar** for full-width reading, or toggle to **Show Raw**.
 
 ## Options
 
@@ -83,6 +83,10 @@ Then run the installed binary from your Go bin directory (for example `$(go env 
 You can open a specific file on startup using the `file` query parameter:
 
 - `http://localhost:8080/?file=docs/readme.md`
+
+For a shared full-screen view without the sidebar, add `fullscreen=1` (or `sidebar=hidden`):
+
+- `http://localhost:8080/?file=docs/readme.md&fullscreen=1`
 
 ## Health endpoint
 
