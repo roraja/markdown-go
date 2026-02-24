@@ -51,6 +51,7 @@ func main() {
 	mux.HandleFunc("/", a.handleIndex)
 	mux.HandleFunc("/api/files", a.handleFiles)
 	mux.HandleFunc("/api/file", a.handleFile)
+	mux.HandleFunc("/api/search", a.handleSearch)
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
@@ -146,6 +147,107 @@ func (a *app) handleFile(w http.ResponseWriter, r *http.Request) {
 		Path:    relPath,
 		Content: string(content),
 	})
+}
+
+type searchResult struct {
+	Path    string `json:"path"`
+	Context string `json:"context"`
+}
+
+func (a *app) handleSearch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	query := strings.TrimSpace(r.URL.Query().Get("q"))
+	if query == "" {
+		http.Error(w, "missing query parameter 'q'", http.StatusBadRequest)
+		return
+	}
+
+	results, err := searchFiles(a.root, query)
+	if err != nil {
+		http.Error(w, "search failed", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(struct {
+		Query   string         `json:"query"`
+		Results []searchResult `json:"results"`
+	}{
+		Query:   query,
+		Results: results,
+	})
+}
+
+func searchFiles(root, query string) ([]searchResult, error) {
+	lowerQuery := strings.ToLower(query)
+	var results []searchResult
+
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() || !isMarkdownFile(d.Name()) {
+			return nil
+		}
+
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return nil // skip unreadable files
+		}
+
+		text := string(content)
+		lowerText := strings.ToLower(text)
+		idx := strings.Index(lowerText, lowerQuery)
+		if idx < 0 {
+			return nil
+		}
+
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return nil
+		}
+
+		// Extract a context snippet around the match
+		contextStart := idx - 60
+		if contextStart < 0 {
+			contextStart = 0
+		}
+		contextEnd := idx + len(query) + 60
+		if contextEnd > len(text) {
+			contextEnd = len(text)
+		}
+
+		snippet := text[contextStart:contextEnd]
+		// Clean up newlines in snippet
+		snippet = strings.ReplaceAll(snippet, "\n", " ")
+		snippet = strings.ReplaceAll(snippet, "\r", "")
+
+		prefix := ""
+		suffix := ""
+		if contextStart > 0 {
+			prefix = "…"
+		}
+		if contextEnd < len(text) {
+			suffix = "…"
+		}
+
+		results = append(results, searchResult{
+			Path:    filepath.ToSlash(rel),
+			Context: prefix + snippet + suffix,
+		})
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].Path < results[j].Path
+	})
+	return results, nil
 }
 
 func listMarkdownFiles(root string) ([]string, error) {
@@ -379,6 +481,94 @@ const indexHTML = `<!DOCTYPE html>
       display: none;
     }
 
+    .search-box {
+      margin-top: 12px;
+      position: relative;
+    }
+
+    .search-box input {
+      width: 100%;
+      padding: 6px 30px 6px 10px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--panel);
+      color: var(--text);
+      font-size: 13px;
+      font-family: inherit;
+      outline: none;
+    }
+
+    .search-box input:focus {
+      border-color: var(--link);
+    }
+
+    .search-box input::placeholder {
+      color: var(--muted);
+    }
+
+    .search-clear {
+      position: absolute;
+      right: 6px;
+      top: 50%;
+      transform: translateY(-50%);
+      border: none;
+      background: transparent;
+      color: var(--muted);
+      cursor: pointer;
+      font-size: 14px;
+      padding: 0 4px;
+      line-height: 1;
+      display: none;
+    }
+
+    .search-clear:hover { color: var(--text); }
+
+    .search-result-item {
+      display: block;
+      width: 100%;
+      border: none;
+      background: transparent;
+      color: var(--text);
+      text-align: left;
+      padding: 8px 8px;
+      cursor: pointer;
+      font-size: 13px;
+      font-family: inherit;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .search-result-item:last-child { border-bottom: none; }
+    .search-result-item:hover { background: var(--panel); }
+    .search-result-item.active { background: var(--active); }
+
+    .search-result-path {
+      font-weight: 600;
+      margin-bottom: 3px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .search-result-context {
+      font-size: 12px;
+      color: var(--muted);
+      line-height: 1.4;
+      word-break: break-word;
+    }
+
+    .search-result-context mark {
+      background: #f0b429;
+      color: #1a1a1a;
+      border-radius: 2px;
+      padding: 0 1px;
+    }
+
+    .search-info {
+      font-size: 12px;
+      color: var(--muted);
+      padding: 8px 0;
+    }
+
     .main {
       padding: 24px;
       overflow-y: auto;
@@ -421,6 +611,11 @@ const indexHTML = `<!DOCTYPE html>
     }
 
     .btn:hover { background: var(--button-hover); }
+    .btn:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+    }
+    .btn:disabled:hover { background: var(--button-bg); }
 
     .viewer {
       border: 1px solid var(--border);
@@ -512,6 +707,10 @@ const indexHTML = `<!DOCTYPE html>
     <aside class="sidebar">
       <h1>Markdown Files</h1>
       <div class="root-path">{{ .Root }}</div>
+      <div class="search-box">
+        <input type="text" id="search-input" placeholder="Search in files…" autocomplete="off" />
+        <button class="search-clear" id="search-clear" type="button">&times;</button>
+      </div>
       <div class="files" id="file-list">
         <div class="muted">Loading files…</div>
       </div>
@@ -523,6 +722,8 @@ const indexHTML = `<!DOCTYPE html>
           <div class="muted">GitHub-like markdown preview with Mermaid support</div>
         </div>
         <div class="header-actions">
+          <button id="prev-file-btn" class="btn nav-btn hidden" type="button" title="Previous file">&#9664; Prev</button>
+          <button id="next-file-btn" class="btn nav-btn hidden" type="button" title="Next file">Next &#9654;</button>
           <button id="toggle-sidebar-btn" class="btn" type="button">Hide Sidebar</button>
           <button id="theme-toggle-btn" class="btn" type="button">Light Mode</button>
           <button id="toggle-raw-btn" class="btn hidden" type="button">Show Raw</button>
@@ -550,6 +751,10 @@ const indexHTML = `<!DOCTYPE html>
     const toggleSidebarBtn = document.getElementById('toggle-sidebar-btn');
     const themeToggleBtn = document.getElementById('theme-toggle-btn');
     const toggleRawBtn = document.getElementById('toggle-raw-btn');
+    const prevFileBtn = document.getElementById('prev-file-btn');
+    const nextFileBtn = document.getElementById('next-file-btn');
+    const searchInput = document.getElementById('search-input');
+    const searchClear = document.getElementById('search-clear');
     const STORAGE_THEME_KEY = 'mdviewer-theme';
 
     let files = [];
@@ -557,6 +762,8 @@ const indexHTML = `<!DOCTYPE html>
     let rawContent = '';
     let showingRaw = false;
     let sidebarHidden = false;
+    let searchTimer = null;
+    let searchMode = false;
 
     if (window.mermaid) {
       window.mermaid.initialize({ startOnLoad: false, securityLevel: 'loose', theme: 'neutral' });
@@ -581,6 +788,50 @@ const indexHTML = `<!DOCTYPE html>
       rawContainerEl.classList.toggle('hidden', !showingRaw);
       toggleRawBtn.textContent = showingRaw ? 'Show Rendered' : 'Show Raw';
     });
+
+    prevFileBtn.addEventListener('click', () => navigateFile(-1));
+    nextFileBtn.addEventListener('click', () => navigateFile(1));
+
+    searchInput.addEventListener('input', () => {
+      const query = searchInput.value.trim();
+      searchClear.style.display = query ? 'block' : 'none';
+      clearTimeout(searchTimer);
+      if (!query) {
+        searchMode = false;
+        renderFileList();
+        return;
+      }
+      searchTimer = setTimeout(() => performSearch(query), 250);
+    });
+
+    searchClear.addEventListener('click', () => {
+      searchInput.value = '';
+      searchClear.style.display = 'none';
+      searchMode = false;
+      renderFileList();
+    });
+
+    function navigateFile(direction) {
+      if (!files.length || !activeFile) return;
+      const idx = files.indexOf(activeFile);
+      const next = idx + direction;
+      if (next >= 0 && next < files.length) {
+        openFile(files[next], true);
+      }
+    }
+
+    function updateNavButtons() {
+      if (!files.length || !activeFile) {
+        prevFileBtn.classList.add('hidden');
+        nextFileBtn.classList.add('hidden');
+        return;
+      }
+      const idx = files.indexOf(activeFile);
+      prevFileBtn.classList.remove('hidden');
+      nextFileBtn.classList.remove('hidden');
+      prevFileBtn.disabled = idx <= 0;
+      nextFileBtn.disabled = idx >= files.length - 1;
+    }
 
     window.addEventListener('popstate', () => {
       const params = new URLSearchParams(window.location.search);
@@ -712,6 +963,10 @@ const indexHTML = `<!DOCTYPE html>
       for (const item of fileListEl.querySelectorAll('.tree-item[data-path]')) {
         item.classList.toggle('active', item.dataset.path === activeFile);
       }
+      for (const item of fileListEl.querySelectorAll('.search-result-item')) {
+        const pathDiv = item.querySelector('.search-result-path');
+        item.classList.toggle('active', pathDiv && pathDiv.textContent === activeFile);
+      }
     }
 
     async function openFile(filePath, pushState) {
@@ -728,6 +983,7 @@ const indexHTML = `<!DOCTYPE html>
         await renderMermaid();
         highlightActiveFile();
         toggleRawBtn.classList.remove('hidden');
+        updateNavButtons();
 
         if (pushState) {
           const url = new URL(window.location.href);
@@ -813,6 +1069,61 @@ const indexHTML = `<!DOCTYPE html>
       const textarea = document.createElement('textarea');
       textarea.innerHTML = text;
       return textarea.value;
+    }
+
+    async function performSearch(query) {
+      try {
+        const response = await fetch('/api/search?q=' + encodeURIComponent(query));
+        if (!response.ok) throw new Error('search failed');
+        const payload = await response.json();
+        searchMode = true;
+        renderSearchResults(payload.results, payload.query);
+      } catch (err) {
+        fileListEl.innerHTML = '<div class="muted">Search failed.</div>';
+      }
+    }
+
+    function renderSearchResults(results, query) {
+      fileListEl.innerHTML = '';
+
+      const info = document.createElement('div');
+      info.className = 'search-info';
+      info.textContent = results.length + ' result' + (results.length !== 1 ? 's' : '') + ' found';
+      fileListEl.appendChild(info);
+
+      if (results.length === 0) return;
+
+      for (const r of results) {
+        const btn = document.createElement('button');
+        btn.className = 'search-result-item';
+        btn.type = 'button';
+        if (r.path === activeFile) btn.classList.add('active');
+
+        const pathDiv = document.createElement('div');
+        pathDiv.className = 'search-result-path';
+        pathDiv.textContent = r.path;
+
+        const ctxDiv = document.createElement('div');
+        ctxDiv.className = 'search-result-context';
+        ctxDiv.innerHTML = highlightQuery(escapeHtml(r.context), query);
+
+        btn.appendChild(pathDiv);
+        btn.appendChild(ctxDiv);
+        btn.addEventListener('click', () => openFile(r.path, true));
+        fileListEl.appendChild(btn);
+      }
+    }
+
+    function highlightQuery(text, query) {
+      const escaped = query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const re = new RegExp('(' + escaped + ')', 'gi');
+      return text.replace(re, '<mark>$1</mark>');
+    }
+
+    function escapeHtml(str) {
+      const div = document.createElement('div');
+      div.textContent = str;
+      return div.innerHTML;
     }
   </script>
 </body>
