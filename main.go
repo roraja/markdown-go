@@ -569,6 +569,14 @@ const indexHTML = `<!DOCTYPE html>
       padding: 8px 0;
     }
 
+    mark.search-highlight {
+      background: #f0b429;
+      color: #1a1a1a;
+      border-radius: 2px;
+      padding: 0 1px;
+      scroll-margin-top: 80px;
+    }
+
     .main {
       padding: 24px;
       overflow-y: auto;
@@ -969,7 +977,7 @@ const indexHTML = `<!DOCTYPE html>
       }
     }
 
-    async function openFile(filePath, pushState) {
+    async function openFile(filePath, pushState, searchQuery) {
       try {
         const response = await fetch('/api/file?path=' + encodeURIComponent(filePath));
         if (!response.ok) throw new Error('failed to load file');
@@ -984,6 +992,15 @@ const indexHTML = `<!DOCTYPE html>
         highlightActiveFile();
         toggleRawBtn.classList.remove('hidden');
         updateNavButtons();
+
+        // Clear previous highlights
+        renderedEl.querySelectorAll('mark.search-highlight').forEach(m => {
+          m.replaceWith(m.textContent);
+        });
+
+        if (searchQuery) {
+          scrollToMatch(renderedEl, searchQuery);
+        }
 
         if (pushState) {
           const url = new URL(window.location.href);
@@ -1109,7 +1126,7 @@ const indexHTML = `<!DOCTYPE html>
 
         btn.appendChild(pathDiv);
         btn.appendChild(ctxDiv);
-        btn.addEventListener('click', () => openFile(r.path, true));
+        btn.addEventListener('click', () => openFile(r.path, true, query));
         fileListEl.appendChild(btn);
       }
     }
@@ -1124,6 +1141,27 @@ const indexHTML = `<!DOCTYPE html>
       const div = document.createElement('div');
       div.textContent = str;
       return div.innerHTML;
+    }
+
+    function scrollToMatch(container, query) {
+      const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, null);
+      const lowerQuery = query.toLowerCase();
+      let node;
+      while ((node = walker.nextNode())) {
+        const idx = node.textContent.toLowerCase().indexOf(lowerQuery);
+        if (idx < 0) continue;
+
+        const range = document.createRange();
+        range.setStart(node, idx);
+        range.setEnd(node, idx + query.length);
+
+        const mark = document.createElement('mark');
+        mark.className = 'search-highlight';
+        range.surroundContents(mark);
+
+        mark.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        return;
+      }
     }
   </script>
 </body>
