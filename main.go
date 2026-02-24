@@ -772,6 +772,7 @@ const indexHTML = `<!DOCTYPE html>
     let sidebarHidden = false;
     let searchTimer = null;
     let searchMode = false;
+    let baseFolderPath = '';
 
     if (window.mermaid) {
       window.mermaid.initialize({ startOnLoad: false, securityLevel: 'loose', theme: 'neutral' });
@@ -854,13 +855,23 @@ const indexHTML = `<!DOCTYPE html>
 
     async function init() {
       try {
+        const params = new URLSearchParams(window.location.search);
+        const rawBase = (params.get('baseFolderPath') || '').replace(/\/+$/, '').replace(/^\/+/, '');
+        baseFolderPath = rawBase;
+
         const response = await fetch('/api/files');
         if (!response.ok) throw new Error('failed to list files');
         const payload = await response.json();
-        files = payload.files || [];
+        let allFiles = payload.files || [];
+
+        if (baseFolderPath) {
+          const prefix = baseFolderPath + '/';
+          files = allFiles.filter(f => f.startsWith(prefix) || f === baseFolderPath);
+        } else {
+          files = allFiles;
+        }
         renderFileList();
 
-        const params = new URLSearchParams(window.location.search);
         applySidebarVisibility(isFullscreenMode(params), false);
         const requested = params.get('file') || INITIAL_FILE;
         if (requested && files.includes(requested)) {
@@ -904,12 +915,12 @@ const indexHTML = `<!DOCTYPE html>
         folderBtn.style.paddingLeft = (depth * 16) + 'px';
 
         const chevron = document.createElement('span');
-        chevron.className = 'tree-chevron expanded';
+        chevron.className = 'tree-chevron';
         chevron.innerHTML = '&#9654;';
 
         const icon = document.createElement('span');
         icon.className = 'tree-icon folder-icon';
-        icon.innerHTML = '&#128193;';
+        icon.innerHTML = '&#128194;';
 
         const label = document.createElement('span');
         label.className = 'tree-label';
@@ -921,7 +932,7 @@ const indexHTML = `<!DOCTYPE html>
         container.appendChild(folderBtn);
 
         const childContainer = document.createElement('div');
-        childContainer.className = 'tree-children';
+        childContainer.className = 'tree-children collapsed';
         container.appendChild(childContainer);
 
         folderBtn.addEventListener('click', () => {
@@ -955,25 +966,54 @@ const indexHTML = `<!DOCTYPE html>
         btn.appendChild(chevronPlaceholder);
         btn.appendChild(icon);
         btn.appendChild(label);
-        btn.addEventListener('click', () => openFile(file.path, true));
+        btn.addEventListener('click', () => {
+          const fullPath = baseFolderPath ? baseFolderPath + '/' + file.path : file.path;
+          openFile(fullPath, true);
+        });
         container.appendChild(btn);
       }
     }
 
     function renderFileList() {
       fileListEl.innerHTML = '';
-      const tree = buildTree(files);
+      let displayFiles = files;
+      if (baseFolderPath) {
+        const prefix = baseFolderPath + '/';
+        displayFiles = files.map(f => f.startsWith(prefix) ? f.slice(prefix.length) : f);
+      }
+      const tree = buildTree(displayFiles);
       renderTreeNode(tree, 0, fileListEl);
       highlightActiveFile();
     }
 
     function highlightActiveFile() {
       for (const item of fileListEl.querySelectorAll('.tree-item[data-path]')) {
-        item.classList.toggle('active', item.dataset.path === activeFile);
+        let displayPath = item.dataset.path;
+        if (baseFolderPath) displayPath = baseFolderPath + '/' + displayPath;
+        const isActive = displayPath === activeFile;
+        item.classList.toggle('active', isActive);
+        if (isActive) expandAncestors(item);
       }
       for (const item of fileListEl.querySelectorAll('.search-result-item')) {
         const pathDiv = item.querySelector('.search-result-path');
         item.classList.toggle('active', pathDiv && pathDiv.textContent === activeFile);
+      }
+    }
+
+    function expandAncestors(el) {
+      let node = el.parentElement;
+      while (node && node !== fileListEl) {
+        if (node.classList.contains('tree-children') && node.classList.contains('collapsed')) {
+          node.classList.remove('collapsed');
+          const folderBtn = node.previousElementSibling;
+          if (folderBtn) {
+            const chevron = folderBtn.querySelector('.tree-chevron');
+            const icon = folderBtn.querySelector('.tree-icon');
+            if (chevron) chevron.classList.add('expanded');
+            if (icon) icon.innerHTML = '&#128193;';
+          }
+        }
+        node = node.parentElement;
       }
     }
 
@@ -1005,6 +1045,7 @@ const indexHTML = `<!DOCTYPE html>
         if (pushState) {
           const url = new URL(window.location.href);
           url.searchParams.set('file', activeFile);
+          if (baseFolderPath) url.searchParams.set('baseFolderPath', baseFolderPath);
           if (sidebarHidden) {
             url.searchParams.set('fullscreen', '1');
             url.searchParams.delete('sidebar');
@@ -1072,6 +1113,7 @@ const indexHTML = `<!DOCTYPE html>
       if (activeFile) {
         url.searchParams.set('file', activeFile);
       }
+      if (baseFolderPath) url.searchParams.set('baseFolderPath', baseFolderPath);
       if (sidebarHidden) {
         url.searchParams.set('fullscreen', '1');
         url.searchParams.delete('sidebar');
