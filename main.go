@@ -14,6 +14,16 @@ import (
 	"strings"
 )
 
+const mdviewerFile = ".mdviewer"
+
+var validTags = map[string]bool{
+	"DONE":        true,
+	"IN-PROGRESS": true,
+	"NEXT":        true,
+	"IMPORTANT":   true,
+	"REVISIT":     true,
+}
+
 type app struct {
 	root string
 	tpl  *template.Template
@@ -22,6 +32,75 @@ type app struct {
 type pageData struct {
 	Root        string
 	InitialFile string
+}
+
+type mdviewerData struct {
+	Tags map[string]string `json:"tags"`
+}
+
+func readMdviewerFile(dirPath string) (mdviewerData, error) {
+	data := mdviewerData{Tags: make(map[string]string)}
+	fp := filepath.Join(dirPath, mdviewerFile)
+	content, err := os.ReadFile(fp)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return data, nil
+		}
+		return data, err
+	}
+	if err := json.Unmarshal(content, &data); err != nil {
+		return mdviewerData{Tags: make(map[string]string)}, nil
+	}
+	if data.Tags == nil {
+		data.Tags = make(map[string]string)
+	}
+	return data, nil
+}
+
+func writeMdviewerFile(dirPath string, data mdviewerData) error {
+	fp := filepath.Join(dirPath, mdviewerFile)
+	if len(data.Tags) == 0 {
+		_ = os.Remove(fp)
+		return nil
+	}
+	content, err := json.MarshalIndent(data, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(fp, content, 0644)
+}
+
+// collectAllTags walks the root and reads all .mdviewer files, returning a map of relative file path to tag.
+func collectAllTags(root string) (map[string]string, error) {
+	tags := make(map[string]string)
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() || d.Name() != mdviewerFile {
+			return nil
+		}
+		dirPath := filepath.Dir(path)
+		data, err := readMdviewerFile(dirPath)
+		if err != nil {
+			return nil
+		}
+		relDir, err := filepath.Rel(root, dirPath)
+		if err != nil {
+			return nil
+		}
+		for fileName, tag := range data.Tags {
+			var relFile string
+			if relDir == "." {
+				relFile = fileName
+			} else {
+				relFile = filepath.ToSlash(filepath.Join(relDir, fileName))
+			}
+			tags[relFile] = tag
+		}
+		return nil
+	})
+	return tags, err
 }
 
 func main() {
@@ -52,6 +131,8 @@ func main() {
 	mux.HandleFunc("/api/files", a.handleFiles)
 	mux.HandleFunc("/api/file", a.handleFile)
 	mux.HandleFunc("/api/search", a.handleSearch)
+	mux.HandleFunc("/api/tags", a.handleTags)
+	mux.HandleFunc("/api/tag", a.handleSetTag)
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
@@ -180,6 +261,80 @@ func (a *app) handleSearch(w http.ResponseWriter, r *http.Request) {
 		Query:   query,
 		Results: results,
 	})
+}
+
+func (a *app) handleTags(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	tags, err := collectAllTags(a.root)
+	if err != nil {
+		http.Error(w, "failed to read tags", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(struct {
+		Tags map[string]string `json:"tags"`
+	}{Tags: tags})
+}
+
+func (a *app) handleSetTag(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Path string `json:"path"`
+		Tag  string `json:"tag"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	relPath, err := sanitizeRelativePath(req.Path)
+	if err != nil {
+		http.Error(w, "invalid path", http.StatusBadRequest)
+		return
+	}
+	if !isMarkdownFile(relPath) {
+		http.Error(w, "only markdown files can be tagged", http.StatusBadRequest)
+		return
+	}
+	if req.Tag != "" && !validTags[req.Tag] {
+		http.Error(w, "invalid tag", http.StatusBadRequest)
+		return
+	}
+
+	dirRel := filepath.Dir(relPath)
+	fileName := filepath.Base(relPath)
+	dirAbs, err := secureJoin(a.root, dirRel)
+	if err != nil {
+		http.Error(w, "invalid path", http.StatusBadRequest)
+		return
+	}
+
+	data, err := readMdviewerFile(dirAbs)
+	if err != nil {
+		http.Error(w, "failed to read tags", http.StatusInternalServerError)
+		return
+	}
+
+	if req.Tag == "" {
+		delete(data.Tags, fileName)
+	} else {
+		data.Tags[fileName] = req.Tag
+	}
+
+	if err := writeMdviewerFile(dirAbs, data); err != nil {
+		http.Error(w, "failed to write tags", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(struct {
+		OK bool `json:"ok"`
+	}{OK: true})
 }
 
 func searchFiles(root, query string) ([]searchResult, error) {
@@ -708,6 +863,48 @@ const indexHTML = `<!DOCTYPE html>
       font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
       font-size: 13px;
     }
+
+    .tree-tag {
+      margin-left: auto;
+      font-size: 12px;
+      line-height: 1;
+      flex-shrink: 0;
+      padding-left: 4px;
+    }
+
+    .tag-menu {
+      position: fixed;
+      z-index: 1000;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 4px 0;
+      min-width: 160px;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.3);
+    }
+
+    .tag-menu-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      width: 100%;
+      border: none;
+      background: transparent;
+      color: var(--text);
+      text-align: left;
+      padding: 6px 12px;
+      cursor: pointer;
+      font-size: 13px;
+      font-family: inherit;
+    }
+
+    .tag-menu-item:hover { background: var(--active); }
+
+    .tag-menu-divider {
+      height: 1px;
+      background: var(--border);
+      margin: 4px 0;
+    }
   </style>
 </head>
 <body>
@@ -773,6 +970,16 @@ const indexHTML = `<!DOCTYPE html>
     let searchTimer = null;
     let searchMode = false;
     let baseFolderPath = '';
+    let fileTags = {};
+
+    const TAG_ICONS = {
+      'DONE': '\u2705',
+      'IN-PROGRESS': '\uD83D\uDD04',
+      'NEXT': '\u23ED\uFE0F',
+      'IMPORTANT': '\u2B50',
+      'REVISIT': '\uD83D\uDD01'
+    };
+    const TAG_LIST = ['DONE', 'IN-PROGRESS', 'NEXT', 'IMPORTANT', 'REVISIT'];
 
     if (window.mermaid) {
       window.mermaid.initialize({ startOnLoad: false, securityLevel: 'loose', theme: 'neutral' });
@@ -859,10 +1066,18 @@ const indexHTML = `<!DOCTYPE html>
         const rawBase = (params.get('baseFolderPath') || '').replace(/\/+$/, '').replace(/^\/+/, '');
         baseFolderPath = rawBase;
 
-        const response = await fetch('/api/files');
-        if (!response.ok) throw new Error('failed to list files');
-        const payload = await response.json();
+        const [filesResp, tagsResp] = await Promise.all([
+          fetch('/api/files'),
+          fetch('/api/tags')
+        ]);
+        if (!filesResp.ok) throw new Error('failed to list files');
+        const payload = await filesResp.json();
         let allFiles = payload.files || [];
+
+        if (tagsResp.ok) {
+          const tagsPayload = await tagsResp.json();
+          fileTags = tagsPayload.tags || {};
+        }
 
         if (baseFolderPath) {
           const prefix = baseFolderPath + '/';
@@ -966,9 +1181,23 @@ const indexHTML = `<!DOCTYPE html>
         btn.appendChild(chevronPlaceholder);
         btn.appendChild(icon);
         btn.appendChild(label);
+
+        const fullFilePath = baseFolderPath ? baseFolderPath + '/' + file.path : file.path;
+        const tag = fileTags[fullFilePath];
+        if (tag && TAG_ICONS[tag]) {
+          const tagSpan = document.createElement('span');
+          tagSpan.className = 'tree-tag';
+          tagSpan.textContent = TAG_ICONS[tag];
+          tagSpan.title = tag;
+          btn.appendChild(tagSpan);
+        }
+
         btn.addEventListener('click', () => {
-          const fullPath = baseFolderPath ? baseFolderPath + '/' + file.path : file.path;
-          openFile(fullPath, true);
+          openFile(fullFilePath, true);
+        });
+        btn.addEventListener('contextmenu', (e) => {
+          e.preventDefault();
+          showTagMenu(e.clientX, e.clientY, fullFilePath);
         });
         container.appendChild(btn);
       }
@@ -1203,6 +1432,73 @@ const indexHTML = `<!DOCTYPE html>
 
         mark.scrollIntoView({ behavior: 'smooth', block: 'center' });
         return;
+      }
+    }
+
+    function showTagMenu(x, y, filePath) {
+      closeTagMenu();
+      const menu = document.createElement('div');
+      menu.className = 'tag-menu';
+      menu.id = 'tag-context-menu';
+
+      const currentTag = fileTags[filePath] || '';
+
+      for (const tag of TAG_LIST) {
+        const item = document.createElement('button');
+        item.className = 'tag-menu-item';
+        item.type = 'button';
+        const prefix = (tag === currentTag) ? '● ' : '  ';
+        item.textContent = prefix + TAG_ICONS[tag] + ' ' + tag;
+        item.addEventListener('click', () => { closeTagMenu(); setTag(filePath, tag === currentTag ? '' : tag); });
+        menu.appendChild(item);
+      }
+
+      if (currentTag) {
+        const divider = document.createElement('div');
+        divider.className = 'tag-menu-divider';
+        menu.appendChild(divider);
+
+        const clearItem = document.createElement('button');
+        clearItem.className = 'tag-menu-item';
+        clearItem.type = 'button';
+        clearItem.textContent = '  ✕ Remove tag';
+        clearItem.addEventListener('click', () => { closeTagMenu(); setTag(filePath, ''); });
+        menu.appendChild(clearItem);
+      }
+
+      // Position menu within viewport
+      menu.style.left = x + 'px';
+      menu.style.top = y + 'px';
+      document.body.appendChild(menu);
+
+      const rect = menu.getBoundingClientRect();
+      if (rect.right > window.innerWidth) menu.style.left = (window.innerWidth - rect.width - 8) + 'px';
+      if (rect.bottom > window.innerHeight) menu.style.top = (window.innerHeight - rect.height - 8) + 'px';
+
+      setTimeout(() => document.addEventListener('click', closeTagMenu, { once: true }), 0);
+    }
+
+    function closeTagMenu() {
+      const existing = document.getElementById('tag-context-menu');
+      if (existing) existing.remove();
+    }
+
+    async function setTag(filePath, tag) {
+      try {
+        const resp = await fetch('/api/tag', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path: filePath, tag: tag })
+        });
+        if (!resp.ok) throw new Error('failed to set tag');
+        if (tag) {
+          fileTags[filePath] = tag;
+        } else {
+          delete fileTags[filePath];
+        }
+        if (!searchMode) renderFileList();
+      } catch (err) {
+        console.error('Failed to set tag:', err);
       }
     }
   </script>
