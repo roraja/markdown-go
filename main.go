@@ -22,6 +22,7 @@ var validTags = map[string]bool{
 	"NEXT":        true,
 	"IMPORTANT":   true,
 	"REVISIT":     true,
+	"ARCHIVE":     true,
 }
 
 type app struct {
@@ -173,6 +174,7 @@ func main() {
 	mux.HandleFunc("/api/tags", a.handleTags)
 	mux.HandleFunc("/api/tag", a.handleSetTag)
 	mux.HandleFunc("/api/opened", a.handleMarkOpened)
+	mux.HandleFunc("/api/archive", a.handleArchive)
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
@@ -457,6 +459,61 @@ func (a *app) handleMarkOpened(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(struct {
 		OK bool `json:"ok"`
 	}{OK: true})
+}
+
+func (a *app) handleArchive(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Files []string `json:"files"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	moved := 0
+	for _, f := range req.Files {
+		relPath, err := sanitizeRelativePath(f)
+		if err != nil || !isMarkdownFile(relPath) {
+			continue
+		}
+		srcAbs, err := secureJoin(a.root, relPath)
+		if err != nil {
+			continue
+		}
+
+		dirRel := filepath.Dir(relPath)
+		fileName := filepath.Base(relPath)
+
+		// Build .archive destination
+		archiveDir := filepath.Join(a.root, dirRel, ".archive")
+		if err := os.MkdirAll(archiveDir, 0755); err != nil {
+			continue
+		}
+		dstAbs := filepath.Join(archiveDir, fileName)
+
+		if err := os.Rename(srcAbs, dstAbs); err != nil {
+			continue
+		}
+
+		// Remove tag and opened state from .mdviewer
+		srcDirAbs := filepath.Join(a.root, filepath.FromSlash(dirRel))
+		data, err := readMdviewerFile(srcDirAbs)
+		if err == nil {
+			delete(data.Tags, fileName)
+			delete(data.Opened, fileName)
+			_ = writeMdviewerFile(srcDirAbs, data)
+		}
+		moved++
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(struct {
+		Moved int `json:"moved"`
+	}{Moved: moved})
 }
 
 func searchFiles(root, query string) ([]searchResult, error) {
@@ -1146,6 +1203,7 @@ const indexHTML = `<!DOCTYPE html>
           <button id="toggle-sidebar-btn" class="btn" type="button">Hide Sidebar</button>
           <button id="theme-toggle-btn" class="btn" type="button">Light Mode</button>
           <button id="toggle-raw-btn" class="btn hidden" type="button">Show Raw</button>
+          <button id="archive-btn" class="btn" type="button" title="Move all ARCHIVE-tagged files to .archive folder">&#128230; Archive</button>
         </div>
       </div>
       <section class="viewer">
@@ -1177,6 +1235,7 @@ const indexHTML = `<!DOCTYPE html>
     const headerTagsEl = document.getElementById('header-tags');
     const tagFilterBtn = document.getElementById('tag-filter-btn');
     const tagFilterDropdown = document.getElementById('tag-filter-dropdown');
+    const archiveBtn = document.getElementById('archive-btn');
     const STORAGE_THEME_KEY = 'mdviewer-theme';
 
     let files = [];
@@ -1197,9 +1256,10 @@ const indexHTML = `<!DOCTYPE html>
       'NEXT': '\u23ED\uFE0F',
       'IMPORTANT': '\u2B50',
       'REVISIT': '\uD83D\uDD01',
+      'ARCHIVE': '\uD83D\uDCE6',
       'UNREAD': '\uD83D\uDCD5'
     };
-    const TAG_LIST = ['DONE', 'IN-PROGRESS', 'NEXT', 'IMPORTANT', 'REVISIT'];
+    const TAG_LIST = ['DONE', 'IN-PROGRESS', 'NEXT', 'IMPORTANT', 'REVISIT', 'ARCHIVE'];
     const ALL_FILTER_TAGS = ['UNREAD', ...TAG_LIST];
 
     if (window.mermaid) {
@@ -1228,6 +1288,55 @@ const indexHTML = `<!DOCTYPE html>
 
     prevFileBtn.addEventListener('click', () => navigateFile(-1));
     nextFileBtn.addEventListener('click', () => navigateFile(1));
+
+    archiveBtn.addEventListener('click', async () => {
+      const archiveFiles = files.filter(f => (fileTags[f] || []).includes('ARCHIVE'));
+      if (archiveFiles.length === 0) {
+        alert('No files tagged with ARCHIVE.');
+        return;
+      }
+      if (!confirm('Move ' + archiveFiles.length + ' file(s) tagged ARCHIVE to .archive folder?')) return;
+      try {
+        const resp = await fetch('/api/archive', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ files: archiveFiles })
+        });
+        if (!resp.ok) { const t = await resp.text(); throw new Error(t); }
+        const result = await resp.json();
+        // Refresh file list and tags
+        const [filesResp, tagsResp] = await Promise.all([fetch('/api/files'), fetch('/api/tags')]);
+        if (filesResp.ok) {
+          const p = await filesResp.json();
+          let allFiles = p.files || [];
+          if (baseFolderPath) {
+            const prefix = baseFolderPath + '/';
+            files = allFiles.filter(f => f.startsWith(prefix) || f === baseFolderPath);
+          } else {
+            files = allFiles;
+          }
+        }
+        if (tagsResp.ok) {
+          const tp = await tagsResp.json();
+          fileTags = tp.tags || {};
+          fileOpened = tp.opened || {};
+        }
+        renderFileList();
+        if (activeFile && !files.includes(activeFile)) {
+          if (files.length > 0) {
+            await openFile(files[0], true);
+          } else {
+            activeFile = '';
+            fileNameEl.textContent = 'Select a markdown file';
+            renderedEl.innerHTML = '<div class="muted">No markdown files found.</div>';
+            renderHeaderTags();
+          }
+        }
+        alert('Archived ' + result.moved + ' file(s).');
+      } catch (err) {
+        alert('Archive failed: ' + err.message);
+      }
+    });
 
     searchInput.addEventListener('input', () => {
       const query = searchInput.value.trim();
