@@ -173,10 +173,10 @@ ReleaseNewVersion() {
   echo "New version: $new_tag"
   printf "Proceed? [y/N]: "
   read -r confirm
-  if [ "${confirm,,}" != "y" ]; then
-    echo "Aborted."
-    return 0
-  fi
+  case "$confirm" in
+    y|Y) ;;
+    *) echo "Aborted."; return 0 ;;
+  esac
 
   git tag -a "$new_tag" -m "Release $new_tag" || return 1
   git push origin "$new_tag" || return 1
