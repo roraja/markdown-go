@@ -35,11 +35,17 @@ type pageData struct {
 }
 
 type mdviewerData struct {
+	Tags   map[string][]string `json:"tags"`
+	Opened map[string]bool     `json:"opened"`
+}
+
+// mdviewerDataLegacy handles the old single-tag format for migration.
+type mdviewerDataLegacy struct {
 	Tags map[string]string `json:"tags"`
 }
 
 func readMdviewerFile(dirPath string) (mdviewerData, error) {
-	data := mdviewerData{Tags: make(map[string]string)}
+	data := mdviewerData{Tags: make(map[string][]string), Opened: make(map[string]bool)}
 	fp := filepath.Join(dirPath, mdviewerFile)
 	content, err := os.ReadFile(fp)
 	if err != nil {
@@ -49,17 +55,31 @@ func readMdviewerFile(dirPath string) (mdviewerData, error) {
 		return data, err
 	}
 	if err := json.Unmarshal(content, &data); err != nil {
-		return mdviewerData{Tags: make(map[string]string)}, nil
+		// Try legacy single-tag format
+		var legacy mdviewerDataLegacy
+		if err2 := json.Unmarshal(content, &legacy); err2 == nil && legacy.Tags != nil {
+			data.Tags = make(map[string][]string)
+			for k, v := range legacy.Tags {
+				if v != "" {
+					data.Tags[k] = []string{v}
+				}
+			}
+			return data, nil
+		}
+		return mdviewerData{Tags: make(map[string][]string), Opened: make(map[string]bool)}, nil
 	}
 	if data.Tags == nil {
-		data.Tags = make(map[string]string)
+		data.Tags = make(map[string][]string)
+	}
+	if data.Opened == nil {
+		data.Opened = make(map[string]bool)
 	}
 	return data, nil
 }
 
 func writeMdviewerFile(dirPath string, data mdviewerData) error {
 	fp := filepath.Join(dirPath, mdviewerFile)
-	if len(data.Tags) == 0 {
+	if len(data.Tags) == 0 && len(data.Opened) == 0 {
 		_ = os.Remove(fp)
 		return nil
 	}
@@ -70,9 +90,17 @@ func writeMdviewerFile(dirPath string, data mdviewerData) error {
 	return os.WriteFile(fp, content, 0644)
 }
 
-// collectAllTags walks the root and reads all .mdviewer files, returning a map of relative file path to tag.
-func collectAllTags(root string) (map[string]string, error) {
-	tags := make(map[string]string)
+type allTagsResult struct {
+	Tags   map[string][]string `json:"tags"`
+	Opened map[string]bool     `json:"opened"`
+}
+
+// collectAllTags walks the root and reads all .mdviewer files, returning tags and opened state per file.
+func collectAllTags(root string) (allTagsResult, error) {
+	result := allTagsResult{
+		Tags:   make(map[string][]string),
+		Opened: make(map[string]bool),
+	}
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil
@@ -89,18 +117,29 @@ func collectAllTags(root string) (map[string]string, error) {
 		if err != nil {
 			return nil
 		}
-		for fileName, tag := range data.Tags {
+		for fileName, tags := range data.Tags {
 			var relFile string
 			if relDir == "." {
 				relFile = fileName
 			} else {
 				relFile = filepath.ToSlash(filepath.Join(relDir, fileName))
 			}
-			tags[relFile] = tag
+			result.Tags[relFile] = tags
+		}
+		for fileName, opened := range data.Opened {
+			if opened {
+				var relFile string
+				if relDir == "." {
+					relFile = fileName
+				} else {
+					relFile = filepath.ToSlash(filepath.Join(relDir, fileName))
+				}
+				result.Opened[relFile] = true
+			}
 		}
 		return nil
 	})
-	return tags, err
+	return result, err
 }
 
 func main() {
@@ -133,6 +172,7 @@ func main() {
 	mux.HandleFunc("/api/search", a.handleSearch)
 	mux.HandleFunc("/api/tags", a.handleTags)
 	mux.HandleFunc("/api/tag", a.handleSetTag)
+	mux.HandleFunc("/api/opened", a.handleMarkOpened)
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
@@ -268,15 +308,13 @@ func (a *app) handleTags(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	tags, err := collectAllTags(a.root)
+	result, err := collectAllTags(a.root)
 	if err != nil {
 		http.Error(w, "failed to read tags", http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	_ = json.NewEncoder(w).Encode(struct {
-		Tags map[string]string `json:"tags"`
-	}{Tags: tags})
+	_ = json.NewEncoder(w).Encode(result)
 }
 
 func (a *app) handleSetTag(w http.ResponseWriter, r *http.Request) {
@@ -285,8 +323,9 @@ func (a *app) handleSetTag(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Path string `json:"path"`
-		Tag  string `json:"tag"`
+		Path   string `json:"path"`
+		Tag    string `json:"tag"`
+		Action string `json:"action"` // "add", "remove", or "clear"
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
@@ -301,7 +340,14 @@ func (a *app) handleSetTag(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "only markdown files can be tagged", http.StatusBadRequest)
 		return
 	}
-	if req.Tag != "" && !validTags[req.Tag] {
+	if req.Action == "" {
+		req.Action = "add"
+	}
+	if req.Action != "add" && req.Action != "remove" && req.Action != "clear" {
+		http.Error(w, "invalid action", http.StatusBadRequest)
+		return
+	}
+	if req.Action != "clear" && req.Tag != "" && !validTags[req.Tag] {
 		http.Error(w, "invalid tag", http.StatusBadRequest)
 		return
 	}
@@ -320,14 +366,90 @@ func (a *app) handleSetTag(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Tag == "" {
+	switch req.Action {
+	case "clear":
 		delete(data.Tags, fileName)
-	} else {
-		data.Tags[fileName] = req.Tag
+	case "remove":
+		if tags, ok := data.Tags[fileName]; ok {
+			filtered := make([]string, 0, len(tags))
+			for _, t := range tags {
+				if t != req.Tag {
+					filtered = append(filtered, t)
+				}
+			}
+			if len(filtered) == 0 {
+				delete(data.Tags, fileName)
+			} else {
+				data.Tags[fileName] = filtered
+			}
+		}
+	case "add":
+		if req.Tag != "" {
+			existing := data.Tags[fileName]
+			found := false
+			for _, t := range existing {
+				if t == req.Tag {
+					found = true
+					break
+				}
+			}
+			if !found {
+				data.Tags[fileName] = append(existing, req.Tag)
+			}
+		}
 	}
 
 	if err := writeMdviewerFile(dirAbs, data); err != nil {
 		http.Error(w, "failed to write tags", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(struct {
+		OK bool `json:"ok"`
+	}{OK: true})
+}
+
+func (a *app) handleMarkOpened(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Path string `json:"path"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	relPath, err := sanitizeRelativePath(req.Path)
+	if err != nil {
+		http.Error(w, "invalid path", http.StatusBadRequest)
+		return
+	}
+	if !isMarkdownFile(relPath) {
+		http.Error(w, "only markdown files supported", http.StatusBadRequest)
+		return
+	}
+
+	dirRel := filepath.Dir(relPath)
+	fileName := filepath.Base(relPath)
+	dirAbs, err := secureJoin(a.root, dirRel)
+	if err != nil {
+		http.Error(w, "invalid path", http.StatusBadRequest)
+		return
+	}
+
+	data, err := readMdviewerFile(dirAbs)
+	if err != nil {
+		http.Error(w, "failed to read data", http.StatusInternalServerError)
+		return
+	}
+
+	data.Opened[fileName] = true
+
+	if err := writeMdviewerFile(dirAbs, data); err != nil {
+		http.Error(w, "failed to write data", http.StatusInternalServerError)
 		return
 	}
 
@@ -905,6 +1027,93 @@ const indexHTML = `<!DOCTYPE html>
       background: var(--border);
       margin: 4px 0;
     }
+
+    .header-tags {
+      display: flex;
+      gap: 4px;
+      flex-wrap: wrap;
+      margin-top: 6px;
+    }
+
+    .header-tag-btn {
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: var(--button-bg);
+      color: var(--muted);
+      padding: 2px 10px;
+      cursor: pointer;
+      font-size: 12px;
+      font-family: inherit;
+      line-height: 1.5;
+      transition: background 0.15s, border-color 0.15s;
+    }
+
+    .header-tag-btn:hover { background: var(--button-hover); }
+
+    .header-tag-btn.active {
+      background: var(--active);
+      border-color: var(--link);
+      color: var(--text);
+    }
+
+    .tag-filter-wrapper {
+      position: relative;
+      margin-top: 6px;
+    }
+
+    .tag-filter-btn {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      width: 100%;
+      padding: 5px 10px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--panel);
+      color: var(--muted);
+      font-size: 12px;
+      font-family: inherit;
+      cursor: pointer;
+      text-align: left;
+    }
+
+    .tag-filter-btn:hover { border-color: var(--link); }
+
+    .tag-filter-dropdown {
+      position: absolute;
+      top: 100%;
+      left: 0;
+      right: 0;
+      z-index: 100;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      margin-top: 2px;
+      padding: 4px 0;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+    }
+
+    .tag-filter-option {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      width: 100%;
+      border: none;
+      background: transparent;
+      color: var(--text);
+      text-align: left;
+      padding: 4px 10px;
+      cursor: pointer;
+      font-size: 12px;
+      font-family: inherit;
+    }
+
+    .tag-filter-option:hover { background: var(--active); }
+
+    .tag-filter-option input[type="checkbox"] {
+      margin: 0;
+      accent-color: var(--link);
+    }
   </style>
 </head>
 <body>
@@ -916,6 +1125,10 @@ const indexHTML = `<!DOCTYPE html>
         <input type="text" id="search-input" placeholder="Search in files…" autocomplete="off" />
         <button class="search-clear" id="search-clear" type="button">&times;</button>
       </div>
+      <div class="tag-filter-wrapper">
+        <button class="tag-filter-btn" id="tag-filter-btn" type="button">🏷️ Filter by tags ▾</button>
+        <div class="tag-filter-dropdown hidden" id="tag-filter-dropdown"></div>
+      </div>
       <div class="files" id="file-list">
         <div class="muted">Loading files…</div>
       </div>
@@ -925,6 +1138,7 @@ const indexHTML = `<!DOCTYPE html>
         <div>
           <h2 id="file-name">Select a markdown file</h2>
           <div class="muted">GitHub-like markdown preview with Mermaid support</div>
+          <div class="header-tags hidden" id="header-tags"></div>
         </div>
         <div class="header-actions">
           <button id="prev-file-btn" class="btn nav-btn hidden" type="button" title="Previous file">&#9664; Prev</button>
@@ -960,6 +1174,9 @@ const indexHTML = `<!DOCTYPE html>
     const nextFileBtn = document.getElementById('next-file-btn');
     const searchInput = document.getElementById('search-input');
     const searchClear = document.getElementById('search-clear');
+    const headerTagsEl = document.getElementById('header-tags');
+    const tagFilterBtn = document.getElementById('tag-filter-btn');
+    const tagFilterDropdown = document.getElementById('tag-filter-dropdown');
     const STORAGE_THEME_KEY = 'mdviewer-theme';
 
     let files = [];
@@ -971,15 +1188,19 @@ const indexHTML = `<!DOCTYPE html>
     let searchMode = false;
     let baseFolderPath = '';
     let fileTags = {};
+    let fileOpened = {};
+    let activeTagFilters = new Set();
 
     const TAG_ICONS = {
       'DONE': '\u2705',
       'IN-PROGRESS': '\uD83D\uDD04',
       'NEXT': '\u23ED\uFE0F',
       'IMPORTANT': '\u2B50',
-      'REVISIT': '\uD83D\uDD01'
+      'REVISIT': '\uD83D\uDD01',
+      'UNREAD': '\uD83D\uDCD5'
     };
     const TAG_LIST = ['DONE', 'IN-PROGRESS', 'NEXT', 'IMPORTANT', 'REVISIT'];
+    const ALL_FILTER_TAGS = ['UNREAD', ...TAG_LIST];
 
     if (window.mermaid) {
       window.mermaid.initialize({ startOnLoad: false, securityLevel: 'loose', theme: 'neutral' });
@@ -1026,6 +1247,70 @@ const indexHTML = `<!DOCTYPE html>
       searchMode = false;
       renderFileList();
     });
+
+    tagFilterBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const isHidden = tagFilterDropdown.classList.toggle('hidden');
+      if (!isHidden) {
+        renderTagFilterDropdown();
+        setTimeout(() => document.addEventListener('click', closeTagFilter, { once: true }), 0);
+      }
+    });
+
+    function closeTagFilter() {
+      tagFilterDropdown.classList.add('hidden');
+    }
+
+    function renderTagFilterDropdown() {
+      tagFilterDropdown.innerHTML = '';
+      for (const tag of ALL_FILTER_TAGS) {
+        const label = document.createElement('label');
+        label.className = 'tag-filter-option';
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.checked = activeTagFilters.has(tag);
+        cb.addEventListener('change', (e) => {
+          e.stopPropagation();
+          if (cb.checked) {
+            activeTagFilters.add(tag);
+          } else {
+            activeTagFilters.delete(tag);
+          }
+          updateTagFilterBtnLabel();
+          if (!searchMode) renderFileList();
+        });
+        label.appendChild(cb);
+        label.appendChild(document.createTextNode(TAG_ICONS[tag] + ' ' + tag));
+        label.addEventListener('click', (e) => e.stopPropagation());
+        tagFilterDropdown.appendChild(label);
+      }
+    }
+
+    function updateTagFilterBtnLabel() {
+      if (activeTagFilters.size === 0) {
+        tagFilterBtn.textContent = '\uD83C\uDFF7\uFE0F Filter by tags \u25BE';
+      } else {
+        const icons = [...activeTagFilters].map(t => TAG_ICONS[t] || t).join(' ');
+        tagFilterBtn.textContent = '\uD83C\uDFF7\uFE0F ' + icons + ' \u25BE';
+      }
+    }
+
+    function getEffectiveTags(filePath) {
+      const tags = (fileTags[filePath] || []).slice();
+      if (!fileOpened[filePath]) {
+        tags.push('UNREAD');
+      }
+      return tags;
+    }
+
+    function fileMatchesTagFilter(filePath) {
+      if (activeTagFilters.size === 0) return true;
+      const tags = getEffectiveTags(filePath);
+      for (const f of activeTagFilters) {
+        if (tags.includes(f)) return true;
+      }
+      return false;
+    }
 
     function navigateFile(direction) {
       if (!files.length || !activeFile) return;
@@ -1077,6 +1362,7 @@ const indexHTML = `<!DOCTYPE html>
         if (tagsResp.ok) {
           const tagsPayload = await tagsResp.json();
           fileTags = tagsPayload.tags || {};
+          fileOpened = tagsPayload.opened || {};
         }
 
         if (baseFolderPath) {
@@ -1183,12 +1469,12 @@ const indexHTML = `<!DOCTYPE html>
         btn.appendChild(label);
 
         const fullFilePath = baseFolderPath ? baseFolderPath + '/' + file.path : file.path;
-        const tag = fileTags[fullFilePath];
-        if (tag && TAG_ICONS[tag]) {
+        const tags = getEffectiveTags(fullFilePath);
+        if (tags.length > 0) {
           const tagSpan = document.createElement('span');
           tagSpan.className = 'tree-tag';
-          tagSpan.textContent = TAG_ICONS[tag];
-          tagSpan.title = tag;
+          tagSpan.textContent = tags.map(t => TAG_ICONS[t] || '').filter(Boolean).join('');
+          tagSpan.title = tags.join(', ');
           btn.appendChild(tagSpan);
         }
 
@@ -1209,6 +1495,12 @@ const indexHTML = `<!DOCTYPE html>
       if (baseFolderPath) {
         const prefix = baseFolderPath + '/';
         displayFiles = files.map(f => f.startsWith(prefix) ? f.slice(prefix.length) : f);
+      }
+      if (activeTagFilters.size > 0) {
+        displayFiles = displayFiles.filter(f => {
+          const fullPath = baseFolderPath ? baseFolderPath + '/' + f : f;
+          return fileMatchesTagFilter(fullPath);
+        });
       }
       const tree = buildTree(displayFiles);
       renderTreeNode(tree, 0, fileListEl);
@@ -1261,6 +1553,18 @@ const indexHTML = `<!DOCTYPE html>
         highlightActiveFile();
         toggleRawBtn.classList.remove('hidden');
         updateNavButtons();
+        renderHeaderTags();
+
+        // Mark as opened if not already
+        if (!fileOpened[activeFile]) {
+          fileOpened[activeFile] = true;
+          fetch('/api/opened', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path: activeFile })
+          }).catch(() => {});
+          if (!searchMode) renderFileList();
+        }
 
         // Clear previous highlights
         renderedEl.querySelectorAll('mark.search-highlight').forEach(m => {
@@ -1441,19 +1745,28 @@ const indexHTML = `<!DOCTYPE html>
       menu.className = 'tag-menu';
       menu.id = 'tag-context-menu';
 
-      const currentTag = fileTags[filePath] || '';
+      const currentTags = fileTags[filePath] || [];
 
       for (const tag of TAG_LIST) {
         const item = document.createElement('button');
         item.className = 'tag-menu-item';
         item.type = 'button';
-        const prefix = (tag === currentTag) ? '● ' : '  ';
+        const hasTag = currentTags.includes(tag);
+        const prefix = hasTag ? '☑ ' : '☐ ';
         item.textContent = prefix + TAG_ICONS[tag] + ' ' + tag;
-        item.addEventListener('click', () => { closeTagMenu(); setTag(filePath, tag === currentTag ? '' : tag); });
+        item.addEventListener('click', (e) => {
+          e.stopPropagation();
+          if (hasTag) {
+            setTag(filePath, tag, 'remove');
+          } else {
+            setTag(filePath, tag, 'add');
+          }
+          closeTagMenu();
+        });
         menu.appendChild(item);
       }
 
-      if (currentTag) {
+      if (currentTags.length > 0) {
         const divider = document.createElement('div');
         divider.className = 'tag-menu-divider';
         menu.appendChild(divider);
@@ -1461,12 +1774,11 @@ const indexHTML = `<!DOCTYPE html>
         const clearItem = document.createElement('button');
         clearItem.className = 'tag-menu-item';
         clearItem.type = 'button';
-        clearItem.textContent = '  ✕ Remove tag';
-        clearItem.addEventListener('click', () => { closeTagMenu(); setTag(filePath, ''); });
+        clearItem.textContent = '  ✕ Remove all tags';
+        clearItem.addEventListener('click', () => { closeTagMenu(); setTag(filePath, '', 'clear'); });
         menu.appendChild(clearItem);
       }
 
-      // Position menu within viewport
       menu.style.left = x + 'px';
       menu.style.top = y + 'px';
       document.body.appendChild(menu);
@@ -1483,22 +1795,57 @@ const indexHTML = `<!DOCTYPE html>
       if (existing) existing.remove();
     }
 
-    async function setTag(filePath, tag) {
+    async function setTag(filePath, tag, action) {
       try {
         const resp = await fetch('/api/tag', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ path: filePath, tag: tag })
+          body: JSON.stringify({ path: filePath, tag: tag, action: action || 'add' })
         });
         if (!resp.ok) throw new Error('failed to set tag');
-        if (tag) {
-          fileTags[filePath] = tag;
-        } else {
+
+        // Update local state
+        if (action === 'clear') {
           delete fileTags[filePath];
+        } else if (action === 'remove') {
+          const arr = fileTags[filePath] || [];
+          fileTags[filePath] = arr.filter(t => t !== tag);
+          if (fileTags[filePath].length === 0) delete fileTags[filePath];
+        } else {
+          const arr = fileTags[filePath] || [];
+          if (!arr.includes(tag)) {
+            fileTags[filePath] = [...arr, tag];
+          }
         }
         if (!searchMode) renderFileList();
+        if (filePath === activeFile) renderHeaderTags();
       } catch (err) {
         console.error('Failed to set tag:', err);
+      }
+    }
+
+    function renderHeaderTags() {
+      headerTagsEl.innerHTML = '';
+      if (!activeFile) {
+        headerTagsEl.classList.add('hidden');
+        return;
+      }
+      headerTagsEl.classList.remove('hidden');
+      const currentTags = fileTags[activeFile] || [];
+      for (const tag of TAG_LIST) {
+        const btn = document.createElement('button');
+        btn.className = 'header-tag-btn';
+        btn.type = 'button';
+        if (currentTags.includes(tag)) btn.classList.add('active');
+        btn.textContent = TAG_ICONS[tag] + ' ' + tag;
+        btn.addEventListener('click', () => {
+          if (currentTags.includes(tag)) {
+            setTag(activeFile, tag, 'remove');
+          } else {
+            setTag(activeFile, tag, 'add');
+          }
+        });
+        headerTagsEl.appendChild(btn);
       }
     }
   </script>
