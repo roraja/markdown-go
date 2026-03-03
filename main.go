@@ -1658,6 +1658,8 @@ const indexHTML = `<!DOCTYPE html>
         fileNameEl.textContent = activeFile;
         rawCodeEl.textContent = rawContent;
         renderedEl.innerHTML = renderMarkdown(rawContent);
+        const firstHeader = renderedEl.querySelector('h1, h2, h3, h4, h5, h6');
+        document.title = firstHeader ? firstHeader.textContent.trim() + ' - Markdown Viewer' : 'Markdown Viewer';
         await renderMermaid();
         highlightActiveFile();
         toggleRawBtn.classList.remove('hidden');
