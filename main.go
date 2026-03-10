@@ -718,6 +718,9 @@ const indexHTML = `<!DOCTYPE html>
       background: var(--sidebar-bg);
       padding: 16px;
       overflow-y: auto;
+      position: sticky;
+      top: 0;
+      height: 100vh;
     }
 
     .sidebar h1 {
