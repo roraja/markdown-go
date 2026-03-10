@@ -175,6 +175,7 @@ func main() {
 	mux.HandleFunc("/api/tag", a.handleSetTag)
 	mux.HandleFunc("/api/opened", a.handleMarkOpened)
 	mux.HandleFunc("/api/archive", a.handleArchive)
+	mux.HandleFunc("/api/save", a.handleSave)
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
@@ -455,6 +456,52 @@ func (a *app) handleMarkOpened(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(struct {
+		OK bool `json:"ok"`
+	}{OK: true})
+}
+
+func (a *app) handleSave(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Path    string `json:"path"`
+		Content string `json:"content"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	relPath, err := sanitizeRelativePath(req.Path)
+	if err != nil {
+		http.Error(w, "invalid path", http.StatusBadRequest)
+		return
+	}
+	if !isMarkdownFile(relPath) {
+		http.Error(w, "only markdown files are supported", http.StatusBadRequest)
+		return
+	}
+	fullPath, err := secureJoin(a.root, relPath)
+	if err != nil {
+		http.Error(w, "invalid path", http.StatusBadRequest)
+		return
+	}
+	// Verify file exists before writing
+	if _, err := os.Stat(fullPath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			http.Error(w, "file not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, "failed to stat file", http.StatusInternalServerError)
+		return
+	}
+	if err := os.WriteFile(fullPath, []byte(req.Content), 0644); err != nil {
+		http.Error(w, "failed to write file", http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	_ = json.NewEncoder(w).Encode(struct {
 		OK bool `json:"ok"`
@@ -1174,6 +1221,36 @@ const indexHTML = `<!DOCTYPE html>
       margin: 0;
       accent-color: var(--link);
     }
+
+    #edit-textarea {
+      width: 100%;
+      min-height: 500px;
+      padding: 16px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--panel);
+      color: var(--text);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 14px;
+      line-height: 1.6;
+      resize: vertical;
+      outline: none;
+      tab-size: 2;
+    }
+
+    #edit-textarea:focus {
+      border-color: var(--link);
+    }
+
+    .save-status {
+      font-size: 12px;
+      color: var(--muted);
+      margin-left: 8px;
+    }
+
+    .markdown-body input[type="checkbox"] {
+      cursor: pointer;
+    }
   </style>
 </head>
 <body>
@@ -1206,6 +1283,9 @@ const indexHTML = `<!DOCTYPE html>
           <button id="toggle-sidebar-btn" class="btn" type="button">Hide Sidebar</button>
           <button id="theme-toggle-btn" class="btn" type="button">Light Mode</button>
           <button id="toggle-raw-btn" class="btn hidden" type="button">Show Raw</button>
+          <button id="edit-btn" class="btn hidden" type="button">✏️ Edit</button>
+          <button id="save-btn" class="btn hidden" type="button" style="background:#238636;border-color:#238636;color:#fff;">💾 Save</button>
+          <button id="cancel-edit-btn" class="btn hidden" type="button">Cancel</button>
           <button id="archive-btn" class="btn" type="button" title="Move all ARCHIVE-tagged files to .archive folder">&#128230; Archive</button>
         </div>
       </div>
@@ -1971,6 +2051,153 @@ const indexHTML = `<!DOCTYPE html>
         headerTagsEl.appendChild(btn);
       }
     }
+    // ---- Edit Mode ----
+    const editBtn = document.getElementById('edit-btn');
+    const saveBtn = document.getElementById('save-btn');
+    const cancelEditBtn = document.getElementById('cancel-edit-btn');
+    let editMode = false;
+    let editTextarea = null;
+
+    editBtn.addEventListener('click', enterEditMode);
+    saveBtn.addEventListener('click', saveEdit);
+    cancelEditBtn.addEventListener('click', exitEditMode);
+
+    function enterEditMode() {
+      if (!activeFile || editMode) return;
+      editMode = true;
+      editBtn.classList.add('hidden');
+      saveBtn.classList.remove('hidden');
+      cancelEditBtn.classList.remove('hidden');
+      toggleRawBtn.classList.add('hidden');
+      rawContainerEl.classList.add('hidden');
+
+      editTextarea = document.createElement('textarea');
+      editTextarea.id = 'edit-textarea';
+      editTextarea.value = rawContent;
+      // Auto-resize
+      editTextarea.addEventListener('input', () => {
+        editTextarea.style.height = 'auto';
+        editTextarea.style.height = editTextarea.scrollHeight + 'px';
+      });
+      // Tab support
+      editTextarea.addEventListener('keydown', (e) => {
+        if (e.key === 'Tab') {
+          e.preventDefault();
+          const start = editTextarea.selectionStart;
+          const end = editTextarea.selectionEnd;
+          editTextarea.value = editTextarea.value.substring(0, start) + '  ' + editTextarea.value.substring(end);
+          editTextarea.selectionStart = editTextarea.selectionEnd = start + 2;
+        }
+        // Ctrl+S / Cmd+S to save
+        if ((e.ctrlKey || e.metaKey) && e.key === 's') {
+          e.preventDefault();
+          saveEdit();
+        }
+      });
+
+      renderedEl.classList.add('hidden');
+      const viewer = document.querySelector('.viewer');
+      viewer.appendChild(editTextarea);
+      setTimeout(() => {
+        editTextarea.style.height = editTextarea.scrollHeight + 'px';
+        editTextarea.focus();
+      }, 0);
+    }
+
+    async function saveEdit() {
+      if (!editMode || !activeFile) return;
+      const content = editTextarea ? editTextarea.value : rawContent;
+      saveBtn.disabled = true;
+      saveBtn.textContent = 'Saving…';
+      try {
+        const resp = await fetch('/api/save', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path: activeFile, content: content })
+        });
+        if (!resp.ok) {
+          const t = await resp.text();
+          throw new Error(t);
+        }
+        rawContent = content;
+        exitEditMode();
+        // Re-render
+        rawCodeEl.textContent = rawContent;
+        renderedEl.innerHTML = renderMarkdown(rawContent);
+        await renderMermaid();
+        attachCheckboxHandlers();
+      } catch (err) {
+        alert('Save failed: ' + err.message);
+      } finally {
+        saveBtn.disabled = false;
+        saveBtn.textContent = '💾 Save';
+      }
+    }
+
+    function exitEditMode() {
+      editMode = false;
+      editBtn.classList.remove('hidden');
+      saveBtn.classList.add('hidden');
+      cancelEditBtn.classList.add('hidden');
+      toggleRawBtn.classList.remove('hidden');
+      renderedEl.classList.remove('hidden');
+      if (editTextarea) {
+        editTextarea.remove();
+        editTextarea = null;
+      }
+    }
+
+    // ---- Checkbox Toggle ----
+    function attachCheckboxHandlers() {
+      const checkboxes = renderedEl.querySelectorAll('input[type="checkbox"]');
+      checkboxes.forEach((cb, idx) => {
+        cb.removeAttribute('disabled');
+        cb.addEventListener('change', () => toggleCheckbox(idx, cb.checked));
+      });
+    }
+
+    async function toggleCheckbox(index, checked) {
+      // Find the nth checkbox pattern in raw markdown and toggle it
+      let count = 0;
+      const lines = rawContent.split('\n');
+      for (let i = 0; i < lines.length; i++) {
+        const match = lines[i].match(/^(\s*(?:[-*+]|\d+[.)]) \s*)\[([ xX])\]/);
+        if (match) {
+          if (count === index) {
+            const prefix = match[1];
+            const rest = lines[i].substring(match[0].length);
+            lines[i] = prefix + '[' + (checked ? 'x' : ' ') + ']' + rest;
+            break;
+          }
+          count++;
+        }
+      }
+      const newContent = lines.join('\n');
+      try {
+        const resp = await fetch('/api/save', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path: activeFile, content: newContent })
+        });
+        if (!resp.ok) throw new Error('save failed');
+        rawContent = newContent;
+        rawCodeEl.textContent = rawContent;
+      } catch (err) {
+        // Revert checkbox visually
+        const checkboxes = renderedEl.querySelectorAll('input[type="checkbox"]');
+        if (checkboxes[index]) checkboxes[index].checked = !checked;
+      }
+    }
+
+    // Patch openFile to attach checkbox handlers after render
+    const _origOpenFile = openFile;
+    openFile = async function(filePath, pushState, searchQuery) {
+      await _origOpenFile(filePath, pushState, searchQuery);
+      attachCheckboxHandlers();
+      editBtn.classList.remove('hidden');
+      if (editMode) exitEditMode();
+    };
+
   </script>
 </body>
 </html>
