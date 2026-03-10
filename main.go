@@ -1744,7 +1744,16 @@ const indexHTML = `<!DOCTYPE html>
       }
 
       const sidebar = (params.get('sidebar') || '').toLowerCase();
-      return sidebar === 'hidden' || sidebar === '0' || sidebar === 'false';
+      if (sidebar === 'hidden' || sidebar === '0' || sidebar === 'false') {
+        return true;
+      }
+
+      // Hide sidebar by default when a file is specified in URL
+      if (params.get('file')) {
+        return true;
+      }
+
+      return false;
     }
 
     function applySidebarVisibility(hidden, pushState) {
