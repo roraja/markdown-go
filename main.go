@@ -1773,14 +1773,9 @@ const indexHTML = `<!DOCTYPE html>
           const url = new URL(window.location.href);
           url.searchParams.set('file', activeFile);
           if (baseFolderPath) url.searchParams.set('baseFolderPath', baseFolderPath);
-          if (sidebarHidden) {
-            url.searchParams.set('fullscreen', '1');
-            url.searchParams.delete('sidebar');
-          } else {
-            url.searchParams.delete('fullscreen');
-            url.searchParams.delete('sidebar');
-          }
-          window.history.pushState({ file: activeFile, fullscreen: sidebarHidden }, '', url);
+          url.searchParams.set('sidebar', sidebarHidden ? '0' : '1');
+          url.searchParams.delete('fullscreen');
+          window.history.pushState({ file: activeFile, sidebar: !sidebarHidden }, '', url);
         }
       } catch (err) {
         renderedEl.innerHTML = '<div class="muted">Failed to load markdown file.</div>';
@@ -1817,24 +1812,32 @@ const indexHTML = `<!DOCTYPE html>
       themeToggleBtn.textContent = resolvedTheme === 'dark' ? 'Light Mode' : 'Dark Mode';
     }
 
-    function isFullscreenMode(params) {
+    function shouldHideSidebar(params) {
+      // Explicit sidebar param takes highest precedence
+      const sidebar = (params.get('sidebar') || '').toLowerCase();
+      if (sidebar === '1' || sidebar === 'true' || sidebar === 'yes') {
+        return false;
+      }
+      if (sidebar === '0' || sidebar === 'false' || sidebar === 'hidden') {
+        return true;
+      }
+
+      // Legacy fullscreen param
       const fullscreen = (params.get('fullscreen') || '').toLowerCase();
       if (fullscreen === '1' || fullscreen === 'true' || fullscreen === 'yes') {
         return true;
       }
 
-      const sidebar = (params.get('sidebar') || '').toLowerCase();
-      if (sidebar === 'hidden' || sidebar === '0' || sidebar === 'false') {
-        return true;
-      }
-
-      // Hide sidebar by default when a file is specified in URL
+      // Hide sidebar by default when a file is specified in URL (and no explicit sidebar param)
       if (params.get('file')) {
         return true;
       }
 
       return false;
     }
+
+    // Legacy alias
+    function isFullscreenMode(params) { return shouldHideSidebar(params); }
 
     function applySidebarVisibility(hidden, pushState) {
       sidebarHidden = Boolean(hidden);
@@ -1850,14 +1853,10 @@ const indexHTML = `<!DOCTYPE html>
         url.searchParams.set('file', activeFile);
       }
       if (baseFolderPath) url.searchParams.set('baseFolderPath', baseFolderPath);
-      if (sidebarHidden) {
-        url.searchParams.set('fullscreen', '1');
-        url.searchParams.delete('sidebar');
-      } else {
-        url.searchParams.delete('fullscreen');
-        url.searchParams.delete('sidebar');
-      }
-      window.history.pushState({ file: activeFile, fullscreen: sidebarHidden }, '', url);
+      // Use sidebar param; remove legacy fullscreen
+      url.searchParams.set('sidebar', sidebarHidden ? '0' : '1');
+      url.searchParams.delete('fullscreen');
+      window.history.pushState({ file: activeFile, sidebar: !sidebarHidden }, '', url);
     }
 
     function decodeHTML(text) {
