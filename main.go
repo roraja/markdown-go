@@ -208,6 +208,12 @@ func (a *app) handleIndex(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+type fileMeta struct {
+	Path       string `json:"path"`
+	ModifiedAt int64  `json:"modifiedAt"`
+	CreatedAt  int64  `json:"createdAt"`
+}
+
 func (a *app) handleFiles(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -220,13 +226,27 @@ func (a *app) handleFiles(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	meta := make([]fileMeta, 0, len(files))
+	for _, f := range files {
+		fullPath := filepath.Join(a.root, filepath.FromSlash(f))
+		info, err := os.Stat(fullPath)
+		m := fileMeta{Path: f}
+		if err == nil {
+			m.ModifiedAt = info.ModTime().UnixMilli()
+			m.CreatedAt = info.ModTime().UnixMilli() // fallback; true ctime not portable
+		}
+		meta = append(meta, m)
+	}
+
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	_ = json.NewEncoder(w).Encode(struct {
-		Root  string   `json:"root"`
-		Files []string `json:"files"`
+		Root  string     `json:"root"`
+		Files []string   `json:"files"`
+		Meta  []fileMeta `json:"meta"`
 	}{
 		Root:  a.root,
 		Files: files,
+		Meta:  meta,
 	})
 }
 
@@ -1266,6 +1286,9 @@ const indexHTML = `<!DOCTYPE html>
         <button class="tag-filter-btn" id="tag-filter-btn" type="button">🏷️ Filter by tags ▾</button>
         <div class="tag-filter-dropdown hidden" id="tag-filter-dropdown"></div>
       </div>
+      <div style="margin-top:6px;">
+        <button class="tag-filter-btn" id="sort-toggle-btn" type="button">📁 Sort: Name</button>
+      </div>
       <div class="files" id="file-list">
         <div class="muted">Loading files…</div>
       </div>
@@ -1319,6 +1342,7 @@ const indexHTML = `<!DOCTYPE html>
     const tagFilterBtn = document.getElementById('tag-filter-btn');
     const tagFilterDropdown = document.getElementById('tag-filter-dropdown');
     const archiveBtn = document.getElementById('archive-btn');
+    const sortToggleBtn = document.getElementById('sort-toggle-btn');
     const STORAGE_THEME_KEY = 'mdviewer-theme';
 
     let files = [];
@@ -1332,6 +1356,8 @@ const indexHTML = `<!DOCTYPE html>
     let fileTags = {};
     let fileOpened = {};
     let activeTagFilters = new Set();
+    let fileMeta = {};  // path -> { modifiedAt, createdAt }
+    let sortMode = 'name'; // 'name' or 'modified'
 
     const TAG_ICONS = {
       'DONE': '\u2705',
@@ -1419,6 +1445,20 @@ const indexHTML = `<!DOCTYPE html>
       } catch (err) {
         alert('Archive failed: ' + err.message);
       }
+    });
+
+    sortToggleBtn.addEventListener('click', () => {
+      sortMode = sortMode === 'name' ? 'modified' : 'name';
+      sortToggleBtn.textContent = sortMode === 'name' ? '📁 Sort: Name' : '🕐 Sort: Modified';
+      if (!searchMode) renderFileList();
+      // Update URL
+      const url = new URL(window.location.href);
+      if (sortMode === 'modified') {
+        url.searchParams.set('sort', 'modified');
+      } else {
+        url.searchParams.delete('sort');
+      }
+      window.history.replaceState(window.history.state, '', url);
     });
 
     searchInput.addEventListener('input', () => {
@@ -1543,6 +1583,12 @@ const indexHTML = `<!DOCTYPE html>
         const rawBase = (params.get('baseFolderPath') || '').replace(/\/+$/, '').replace(/^\/+/, '');
         baseFolderPath = rawBase;
 
+        // Read sort preference from URL
+        if (params.get('sort') === 'modified') {
+          sortMode = 'modified';
+          sortToggleBtn.textContent = '🕐 Sort: Modified';
+        }
+
         const [filesResp, tagsResp] = await Promise.all([
           fetch('/api/files'),
           fetch('/api/tags')
@@ -1550,6 +1596,13 @@ const indexHTML = `<!DOCTYPE html>
         if (!filesResp.ok) throw new Error('failed to list files');
         const payload = await filesResp.json();
         let allFiles = payload.files || [];
+
+        // Store file modification times
+        if (payload.meta) {
+          for (const m of payload.meta) {
+            fileMeta[m.path] = { modifiedAt: m.modifiedAt, createdAt: m.createdAt };
+          }
+        }
 
         if (tagsResp.ok) {
           const tagsPayload = await tagsResp.json();
@@ -1596,9 +1649,55 @@ const indexHTML = `<!DOCTYPE html>
       return root;
     }
 
-    function renderTreeNode(node, depth, container) {
-      const sortedDirs = Object.keys(node.children).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
-      const sortedFiles = node.files.slice().sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
+    function relativeTime(ms) {
+      const diff = Date.now() - ms;
+      const secs = Math.floor(diff / 1000);
+      if (secs < 60) return 'now';
+      const mins = Math.floor(secs / 60);
+      if (mins < 60) return mins + 'm';
+      const hrs = Math.floor(mins / 60);
+      if (hrs < 24) return hrs + 'h';
+      const days = Math.floor(hrs / 24);
+      if (days < 30) return days + 'd';
+      const months = Math.floor(days / 30);
+      return months + 'mo';
+    }
+
+    function getNewestModTime(node, pathPrefix) {
+      let newest = 0;
+      for (const file of node.files) {
+        const fullPath = pathPrefix ? pathPrefix + '/' + file.path : file.path;
+        const meta = fileMeta[fullPath];
+        if (meta && meta.modifiedAt > newest) newest = meta.modifiedAt;
+      }
+      for (const dirName of Object.keys(node.children)) {
+        const childPrefix = pathPrefix ? pathPrefix + '/' + dirName : dirName;
+        const childNewest = getNewestModTime(node.children[dirName], childPrefix);
+        if (childNewest > newest) newest = childNewest;
+      }
+      return newest;
+    }
+
+    function renderTreeNode(node, depth, container, pathPrefix) {
+      let sortedDirs, sortedFiles;
+
+      if (sortMode === 'modified') {
+        sortedDirs = Object.keys(node.children).sort((a, b) => {
+          const prefA = pathPrefix ? pathPrefix + '/' + a : a;
+          const prefB = pathPrefix ? pathPrefix + '/' + b : b;
+          return getNewestModTime(node.children[b], prefB) - getNewestModTime(node.children[a], prefA);
+        });
+        sortedFiles = node.files.slice().sort((a, b) => {
+          const fpA = pathPrefix ? pathPrefix + '/' + a.path : a.path;
+          const fpB = pathPrefix ? pathPrefix + '/' + b.path : b.path;
+          const mtA = (fileMeta[fpA] || {}).modifiedAt || 0;
+          const mtB = (fileMeta[fpB] || {}).modifiedAt || 0;
+          return mtB - mtA;
+        });
+      } else {
+        sortedDirs = Object.keys(node.children).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+        sortedFiles = node.files.slice().sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
+      }
 
       for (const dirName of sortedDirs) {
         const child = node.children[dirName];
@@ -1634,7 +1733,7 @@ const indexHTML = `<!DOCTYPE html>
           icon.innerHTML = isCollapsed ? '&#128194;' : '&#128193;';
         });
 
-        renderTreeNode(child, depth + 1, childContainer);
+        renderTreeNode(child, depth + 1, childContainer, pathPrefix ? pathPrefix + '/' + dirName : dirName);
       }
 
       for (const file of sortedFiles) {
@@ -1661,6 +1760,21 @@ const indexHTML = `<!DOCTYPE html>
         btn.appendChild(label);
 
         const fullFilePath = baseFolderPath ? baseFolderPath + '/' + file.path : file.path;
+
+        // Show relative time when sorting by modified
+        if (sortMode === 'modified') {
+          const meta = fileMeta[fullFilePath];
+          if (meta && meta.modifiedAt) {
+            const timeSpan = document.createElement('span');
+            timeSpan.className = 'tree-tag';
+            timeSpan.style.color = 'var(--muted)';
+            timeSpan.style.fontSize = '11px';
+            timeSpan.textContent = relativeTime(meta.modifiedAt);
+            timeSpan.title = new Date(meta.modifiedAt).toLocaleString();
+            btn.appendChild(timeSpan);
+          }
+        }
+
         const tags = getEffectiveTags(fullFilePath);
         if (tags.length > 0) {
           const tagSpan = document.createElement('span');
@@ -1695,7 +1809,7 @@ const indexHTML = `<!DOCTYPE html>
         });
       }
       const tree = buildTree(displayFiles);
-      renderTreeNode(tree, 0, fileListEl);
+      renderTreeNode(tree, 0, fileListEl, baseFolderPath || '');
       highlightActiveFile();
     }
 
