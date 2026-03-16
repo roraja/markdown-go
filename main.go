@@ -1666,8 +1666,8 @@ const indexHTML = `<!DOCTYPE html>
     function getNewestModTime(node, pathPrefix) {
       let newest = 0;
       for (const file of node.files) {
-        const fullPath = pathPrefix ? pathPrefix + '/' + file.path : file.path;
-        const meta = fileMeta[fullPath];
+        // file.path is already the full path from root
+        const meta = fileMeta[file.path];
         if (meta && meta.modifiedAt > newest) newest = meta.modifiedAt;
       }
       for (const dirName of Object.keys(node.children)) {
@@ -1679,28 +1679,39 @@ const indexHTML = `<!DOCTYPE html>
     }
 
     function renderTreeNode(node, depth, container, pathPrefix) {
-      let sortedDirs, sortedFiles;
-
       if (sortMode === 'modified') {
-        sortedDirs = Object.keys(node.children).sort((a, b) => {
-          const prefA = pathPrefix ? pathPrefix + '/' + a : a;
-          const prefB = pathPrefix ? pathPrefix + '/' + b : b;
-          return getNewestModTime(node.children[b], prefB) - getNewestModTime(node.children[a], prefA);
-        });
-        sortedFiles = node.files.slice().sort((a, b) => {
-          const fpA = pathPrefix ? pathPrefix + '/' + a.path : a.path;
-          const fpB = pathPrefix ? pathPrefix + '/' + b.path : b.path;
-          const mtA = (fileMeta[fpA] || {}).modifiedAt || 0;
-          const mtB = (fileMeta[fpB] || {}).modifiedAt || 0;
-          return mtB - mtA;
-        });
-      } else {
-        sortedDirs = Object.keys(node.children).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
-        sortedFiles = node.files.slice().sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
-      }
+        // Interleave dirs and files, sorted by newest mod time
+        const items = [];
+        for (const dirName of Object.keys(node.children)) {
+          const dirPrefix = pathPrefix ? pathPrefix + '/' + dirName : dirName;
+          items.push({ type: 'dir', name: dirName, modTime: getNewestModTime(node.children[dirName], dirPrefix) });
+        }
+        for (const file of node.files) {
+          // file.path is already full path
+          items.push({ type: 'file', file: file, modTime: (fileMeta[file.path] || {}).modifiedAt || 0 });
+        }
+        items.sort((a, b) => b.modTime - a.modTime);
 
-      for (const dirName of sortedDirs) {
-        const child = node.children[dirName];
+        for (const item of items) {
+          if (item.type === 'dir') {
+            renderDirNode(item.name, node.children[item.name], depth, container, pathPrefix);
+          } else {
+            renderFileNode(item.file, depth, container, pathPrefix);
+          }
+        }
+      } else {
+        const sortedDirs = Object.keys(node.children).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+        const sortedFiles = node.files.slice().sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
+        for (const dirName of sortedDirs) {
+          renderDirNode(dirName, node.children[dirName], depth, container, pathPrefix);
+        }
+        for (const file of sortedFiles) {
+          renderFileNode(file, depth, container, pathPrefix);
+        }
+      }
+    }
+
+    function renderDirNode(dirName, child, depth, container, pathPrefix) {
         const folderBtn = document.createElement('button');
         folderBtn.className = 'tree-item';
         folderBtn.type = 'button';
@@ -1721,6 +1732,22 @@ const indexHTML = `<!DOCTYPE html>
         folderBtn.appendChild(chevron);
         folderBtn.appendChild(icon);
         folderBtn.appendChild(label);
+
+        // Show relative time on folders in modified sort mode
+        if (sortMode === 'modified') {
+          const dirPrefix = pathPrefix ? pathPrefix + '/' + dirName : dirName;
+          const newest = getNewestModTime(child, dirPrefix);
+          if (newest > 0) {
+            const timeSpan = document.createElement('span');
+            timeSpan.className = 'tree-tag';
+            timeSpan.style.color = 'var(--muted)';
+            timeSpan.style.fontSize = '11px';
+            timeSpan.textContent = relativeTime(newest);
+            timeSpan.title = new Date(newest).toLocaleString();
+            folderBtn.appendChild(timeSpan);
+          }
+        }
+
         container.appendChild(folderBtn);
 
         const childContainer = document.createElement('div');
@@ -1734,9 +1761,9 @@ const indexHTML = `<!DOCTYPE html>
         });
 
         renderTreeNode(child, depth + 1, childContainer, pathPrefix ? pathPrefix + '/' + dirName : dirName);
-      }
+    }
 
-      for (const file of sortedFiles) {
+    function renderFileNode(file, depth, container, pathPrefix) {
         const btn = document.createElement('button');
         btn.className = 'tree-item';
         btn.type = 'button';
@@ -1792,7 +1819,6 @@ const indexHTML = `<!DOCTYPE html>
           showTagMenu(e.clientX, e.clientY, fullFilePath);
         });
         container.appendChild(btn);
-      }
     }
 
     function renderFileList() {
