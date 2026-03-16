@@ -176,6 +176,7 @@ func main() {
 	mux.HandleFunc("/api/opened", a.handleMarkOpened)
 	mux.HandleFunc("/api/archive", a.handleArchive)
 	mux.HandleFunc("/api/save", a.handleSave)
+	mux.HandleFunc("/api/media/", a.handleMedia)
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
@@ -480,6 +481,39 @@ func (a *app) handleMarkOpened(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(struct {
 		OK bool `json:"ok"`
 	}{OK: true})
+}
+
+func (a *app) handleMedia(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Strip /api/media/ prefix to get relative path
+	relPath := strings.TrimPrefix(r.URL.Path, "/api/media/")
+	if relPath == "" {
+		http.Error(w, "missing path", http.StatusBadRequest)
+		return
+	}
+
+	// Clean and validate path to prevent directory traversal
+	cleaned := filepath.Clean(filepath.FromSlash(relPath))
+	if strings.HasPrefix(cleaned, "..") || filepath.IsAbs(cleaned) {
+		http.Error(w, "invalid path", http.StatusBadRequest)
+		return
+	}
+
+	fullPath := filepath.Join(a.root, cleaned)
+
+	// Verify the resolved path is within root
+	absRoot, _ := filepath.Abs(a.root)
+	absPath, _ := filepath.Abs(fullPath)
+	if !strings.HasPrefix(absPath, absRoot+string(filepath.Separator)) && absPath != absRoot {
+		http.Error(w, "access denied", http.StatusForbidden)
+		return
+	}
+
+	http.ServeFile(w, r, fullPath)
 }
 
 func (a *app) handleSave(w http.ResponseWriter, r *http.Request) {
@@ -1923,7 +1957,21 @@ const indexHTML = `<!DOCTYPE html>
     }
 
     function renderMarkdown(markdown) {
-      let html = marked.parse(markdown, { gfm: true });
+      // Custom renderer to rewrite relative image paths
+      const renderer = new marked.Renderer();
+      const origImage = renderer.image.bind(renderer);
+      renderer.image = function({ href, title, text }) {
+        if (href && !href.match(/^https?:\/\//) && !href.startsWith('data:') && !href.startsWith('/')) {
+          // Resolve relative to the current file's directory
+          const dir = activeFile ? activeFile.substring(0, activeFile.lastIndexOf('/')) : '';
+          const resolved = dir ? dir + '/' + href : href;
+          href = '/api/media/' + resolved;
+        }
+        const titleAttr = title ? ' title="' + title + '"' : '';
+        return '<img src="' + href + '" alt="' + (text || '') + '"' + titleAttr + ' />';
+      };
+
+      let html = marked.parse(markdown, { gfm: true, renderer: renderer });
       html = html.replace(/<pre><code class="language-mermaid">([\s\S]*?)<\/code><\/pre>/g, (_, code) => {
         return '<div class="mermaid-block"><div class="mermaid">' + decodeHTML(code) + '</div></div>';
       });
