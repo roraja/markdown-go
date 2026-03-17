@@ -2,15 +2,22 @@
 """
 podcast_gen.py — Markdown-to-Podcast generator for mdviewer.
 
-Takes a markdown file, generates a two-person dialogue script via LLM,
+Takes a markdown file, generates a two-person conversational dialogue via LLM,
 then synthesizes speech using Kokoro TTS (ONNX, CPU).
 
 Usage:
-    python3 podcast_gen.py <markdown_file> [--output <output.mp3>] [--api-url <url>] [--api-token <token>]
+    python3 podcast_gen.py <markdown_file> [--output <output.mp3>]
+
+LLM Provider (auto-detected in order):
+    1. --api-url + --api-token (any OpenAI-compatible API)
+    2. PODCAST_API_URL + PODCAST_API_TOKEN env vars
+    3. GitHub Copilot CLI: `gh copilot` with --model flag
+    4. OpenAI API: OPENAI_API_KEY env var
+    5. Anthropic API: ANTHROPIC_API_KEY env var
 
 Architecture:
-    1. Read markdown → extract text, describe mermaid/tables verbally
-    2. LLM generates dialogue script: Host (Sarah) + Guest (Michael)
+    1. Read markdown → extract text
+    2. LLM generates natural conversation: Host (Sarah) + Guest (Michael)
     3. Kokoro TTS generates audio per line with different voices
     4. pydub stitches segments with natural pauses
     5. Outputs MP3
@@ -22,6 +29,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import time
@@ -43,31 +51,36 @@ PAUSE_BETWEEN_SPEAKERS = 400
 PAUSE_WITHIN_SPEAKER = 150
 PAUSE_SECTION_BREAK = 800
 
-DEFAULT_API_URL = "http://localhost:18789/v1/chat/completions"
-
-SYSTEM_PROMPT = """You are a podcast script writer. Convert the given document into a natural two-person dialogue.
+SYSTEM_PROMPT = """You are a podcast script writer. Your job is to transform a technical document into an engaging, natural conversation between two people.
 
 Speakers:
-- [Sarah]: The host. Explains concepts clearly, guides the conversation. Warm, knowledgeable tone.
-- [Michael]: The guest/co-host. Asks clarifying questions, reacts naturally, adds insights. Curious, engaged tone.
+- [Sarah]: The host. She has read the document and explains it to Michael. She's warm, clear, and uses analogies to make technical concepts accessible.
+- [Michael]: The co-host. He's smart but hearing about this topic for the first time. He asks genuine questions, pushes back when something seems off, and makes connections to real-world scenarios.
 
-Rules:
-1. Start with a brief intro: Sarah welcomes listeners, introduces the topic.
-2. Cover ALL key points from the document. Don't skip sections.
-3. For mermaid diagrams: describe the flow/architecture verbally. Say "imagine a diagram where..." or "the flow goes like this..."
-4. For tables: summarize the data conversationally. Don't read cell by cell — highlight patterns and key rows.
-5. For code blocks: explain what the code does in plain English. Only quote tiny snippets if critical.
-6. For issue/bug tables: discuss the most important ones, mention priority and why they matter.
-7. Keep it conversational — use filler words sparingly ("right", "exactly", "interesting").
-8. Each line should be 1-3 sentences max. Short, punchy exchanges.
-9. End with a brief wrap-up/summary.
-10. Output ONLY the dialogue, no stage directions or notes.
+CRITICAL RULES:
+1. This is a CONVERSATION, not a reading. Never say "the document says" or "according to the text." Sarah explains things as if she learned them herself.
+2. Michael should ask questions a real person would ask — "Wait, why does that matter?" or "So what happens if..."
+3. Cover ALL key points but make them flow naturally. Don't follow the document's structure rigidly — reorganize for conversational flow if needed.
+4. For diagrams/tables/code: describe them verbally. "Imagine a pipeline where..." or "Think of it like..." — use analogies.
+5. Keep exchanges SHORT — 1-3 sentences each. Real conversations have quick back-and-forth.
+6. Include natural reactions: surprise, agreement, mild disagreement, humor where appropriate.
+7. Start with Sarah briefly introducing the topic (NOT "welcome to our podcast" — just dive in naturally).
+8. End with a natural wrap-up, not a formal sign-off.
+9. Don't be afraid of tangents if they help explain a concept.
+10. Output ONLY dialogue lines, no stage directions or notes.
 
-Format each line as:
+Format:
 [Sarah] Text here.
 [Michael] Text here.
 
-Do NOT include any other formatting, headers, or markdown."""
+BAD (reading the doc):
+[Sarah] The document describes a system that uses modifier keys during drag and drop.
+[Michael] What does the document say about effectAllowed?
+
+GOOD (natural conversation):
+[Sarah] So you know how when you drag a file in Finder, holding Option makes it copy instead of move?
+[Michael] Yeah, I use that all the time actually.
+[Sarah] Well, browsers just... don't do that. This proposal fixes it."""
 
 
 def read_markdown(filepath: str) -> str:
@@ -76,42 +89,112 @@ def read_markdown(filepath: str) -> str:
         return f.read()
 
 
-def generate_script(markdown_content: str, api_url: str, api_token: str | None, filename: str) -> list[tuple[str, str]]:
-    """Use LLM to generate dialogue script from markdown content."""
+def detect_provider(args) -> dict:
+    """Auto-detect LLM provider. Returns dict with 'type' and connection details."""
+    # 1. Explicit API URL
+    api_url = args.api_url or os.environ.get("PODCAST_API_URL")
+    api_token = args.api_token or os.environ.get("PODCAST_API_TOKEN") or os.environ.get("OPENCLAW_TOKEN")
+    if api_url:
+        return {"type": "openai_compat", "url": api_url, "token": api_token, "model": args.model or "default"}
+
+    # 2. OpenAI
+    if os.environ.get("OPENAI_API_KEY"):
+        return {"type": "openai_compat", "url": "https://api.openai.com/v1/chat/completions",
+                "token": os.environ["OPENAI_API_KEY"], "model": args.model or "gpt-4o"}
+
+    # 3. Anthropic
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return {"type": "anthropic", "token": os.environ["ANTHROPIC_API_KEY"],
+                "model": args.model or "claude-sonnet-4-20250514"}
+
+    # 4. GitHub Copilot CLI
+    try:
+        result = subprocess.run(["gh", "auth", "status"], capture_output=True, timeout=5)
+        if result.returncode == 0:
+            return {"type": "gh_copilot", "model": args.model or "claude-3.5-sonnet"}
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    return {"type": "none"}
+
+
+def call_llm(provider: dict, system_prompt: str, user_msg: str) -> str:
+    """Call LLM via detected provider."""
     import urllib.request
 
+    if provider["type"] == "openai_compat":
+        payload = {
+            "model": provider["model"],
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_msg}
+            ],
+            "temperature": 0.7,
+            "max_tokens": 4096
+        }
+        headers = {"Content-Type": "application/json"}
+        if provider.get("token"):
+            headers["Authorization"] = f"Bearer {provider['token']}"
+
+        req = urllib.request.Request(
+            provider["url"], data=json.dumps(payload).encode(),
+            headers=headers, method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            result = json.loads(resp.read())
+        return result["choices"][0]["message"]["content"]
+
+    elif provider["type"] == "anthropic":
+        payload = {
+            "model": provider["model"],
+            "max_tokens": 4096,
+            "system": system_prompt,
+            "messages": [{"role": "user", "content": user_msg}]
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "x-api-key": provider["token"],
+            "anthropic-version": "2023-06-01"
+        }
+        req = urllib.request.Request(
+            "https://api.anthropic.com/v1/messages",
+            data=json.dumps(payload).encode(), headers=headers, method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            result = json.loads(resp.read())
+        return result["content"][0]["text"]
+
+    elif provider["type"] == "gh_copilot":
+        # Use gh copilot via subprocess
+        full_prompt = f"{system_prompt}\n\n---\n\n{user_msg}"
+        result = subprocess.run(
+            ["gh", "copilot", "suggest", "-t", "shell", full_prompt],
+            capture_output=True, text=True, timeout=120
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"gh copilot failed: {result.stderr}")
+        return result.stdout
+
+    else:
+        raise RuntimeError(
+            "No LLM provider found. Set one of:\n"
+            "  - PODCAST_API_URL + PODCAST_API_TOKEN (any OpenAI-compatible API)\n"
+            "  - OPENAI_API_KEY\n"
+            "  - ANTHROPIC_API_KEY\n"
+            "  - Install GitHub CLI with Copilot extension"
+        )
+
+
+def generate_script(markdown_content: str, provider: dict, filename: str) -> list[tuple[str, str]]:
+    """Use LLM to generate dialogue script from markdown content."""
     user_msg = f"Convert this document into a podcast dialogue:\n\nFilename: {filename}\n\n---\n\n{markdown_content}"
 
-    payload = {
-        "model": "default",
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_msg}
-        ],
-        "temperature": 0.7,
-        "max_tokens": 4096
-    }
-
-    headers = {"Content-Type": "application/json"}
-    if api_token:
-        headers["Authorization"] = f"Bearer {api_token}"
-
-    req = urllib.request.Request(
-        api_url,
-        data=json.dumps(payload).encode(),
-        headers=headers,
-        method="POST"
-    )
-
-    print(f"[script] Generating dialogue via LLM...", flush=True)
+    print(f"[script] Generating dialogue via {provider['type']}...", flush=True)
     t0 = time.time()
 
-    with urllib.request.urlopen(req, timeout=120) as resp:
-        result = json.loads(resp.read())
+    script_text = call_llm(provider, SYSTEM_PROMPT, user_msg)
 
-    script_text = result["choices"][0]["message"]["content"]
     print(f"[script] Generated in {time.time()-t0:.1f}s ({len(script_text)} chars)", flush=True)
-
     return parse_script(script_text)
 
 
@@ -195,12 +278,10 @@ def synthesize_audio(lines: list[tuple[str, str]], progress_callback=None) -> Au
 
 def split_sentences(text: str) -> list[str]:
     """Split text into sentences for more natural TTS delivery."""
-    # Split on sentence boundaries but keep short
     parts = re.split(r'(?<=[.!?])\s+', text)
     result = []
     for part in parts:
         if len(part) > 300:
-            # Further split on commas/semicolons for very long sentences
             sub = re.split(r'(?<=[,;])\s+', part)
             result.extend(sub)
         else:
@@ -212,8 +293,9 @@ def main():
     parser = argparse.ArgumentParser(description="Generate podcast from markdown")
     parser.add_argument("input", help="Input markdown file")
     parser.add_argument("--output", "-o", help="Output audio file (default: <input>.podcast.mp3)")
-    parser.add_argument("--api-url", default=DEFAULT_API_URL, help="LLM API URL")
-    parser.add_argument("--api-token", default=os.environ.get("OPENCLAW_TOKEN"), help="API auth token")
+    parser.add_argument("--api-url", default=None, help="LLM API URL (OpenAI-compatible)")
+    parser.add_argument("--api-token", default=None, help="API auth token")
+    parser.add_argument("--model", default=None, help="Model name (default: auto per provider)")
     parser.add_argument("--script-only", action="store_true", help="Only generate script, don't synthesize")
     parser.add_argument("--from-script", help="Skip LLM, use existing script file")
     args = parser.parse_args()
@@ -232,8 +314,12 @@ def main():
         with open(args.from_script) as f:
             lines = parse_script(f.read())
     else:
+        provider = detect_provider(args)
+        if provider["type"] == "none":
+            print("Error: No LLM provider found. Set PODCAST_API_URL, OPENAI_API_KEY, or ANTHROPIC_API_KEY.", file=sys.stderr)
+            sys.exit(1)
         markdown = read_markdown(str(input_path))
-        lines = generate_script(markdown, args.api_url, args.api_token, input_path.name)
+        lines = generate_script(markdown, provider, input_path.name)
 
         # Save script for debugging/reuse
         with open(script_path, 'w') as f:

@@ -163,3 +163,111 @@ git push origin v1.1.0
 ```
 
 This triggers the workflow in `.github/workflows/release.yml`, which builds binaries for all platforms and creates a GitHub Release with checksums.
+
+## 🎙️ Podcast Generation
+
+mdviewer can generate a two-person podcast conversation from any markdown document. Click the 🎙️ button in the toolbar to generate.
+
+**How it works:**
+1. An LLM reads the markdown and writes a natural two-person dialogue script
+2. [Kokoro TTS](https://github.com/thewh1teagle/kokoro-onnx) (82M ONNX model) synthesizes speech with two distinct voices
+3. The result is an MP3 with natural pauses between speakers
+
+The podcast is a real conversation — not a read-aloud. The host (Sarah) explains concepts using analogies and the guest (Michael) asks genuine questions and pushes back.
+
+### Setup
+
+#### 1. Install Python dependencies
+
+```bash
+pip install kokoro-onnx pydub soundfile numpy
+```
+
+#### 2. Install ffmpeg (needed for MP3 export)
+
+```bash
+# macOS
+brew install ffmpeg
+
+# Ubuntu/Debian
+sudo apt install ffmpeg
+
+# Windows (via chocolatey)
+choco install ffmpeg
+```
+
+#### 3. Download Kokoro TTS model (~338MB total)
+
+```bash
+mkdir -p ~/.local/share/kokoro
+curl -L "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx" \
+  -o ~/.local/share/kokoro/kokoro-v1.0.onnx
+curl -L "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin" \
+  -o ~/.local/share/kokoro/voices-v1.0.bin
+```
+
+#### 4. Place `podcast_gen.py`
+
+The script must be in one of these locations:
+- Same directory as the `mdviewer` binary
+- `/usr/local/share/mdviewer/podcast_gen.py`
+- `~/src/markdown-go/podcast_gen.py`
+
+#### 5. Configure an LLM provider
+
+Set **one** of these (auto-detected in order):
+
+| Provider | Environment Variables |
+|----------|----------------------|
+| Any OpenAI-compatible API | `PODCAST_API_URL` + `PODCAST_API_TOKEN` |
+| OpenAI | `OPENAI_API_KEY` |
+| Anthropic | `ANTHROPIC_API_KEY` |
+
+Example with OpenAI:
+```bash
+export OPENAI_API_KEY="sk-..."
+mdviewer -root ~/docs -port 8080
+```
+
+Example with a local LLM (Ollama, LM Studio, etc.):
+```bash
+export PODCAST_API_URL="http://localhost:11434/v1/chat/completions"
+mdviewer -root ~/docs -port 8080
+```
+
+### Standalone CLI Usage
+
+You can also use `podcast_gen.py` directly:
+
+```bash
+# Generate podcast with OpenAI
+OPENAI_API_KEY="sk-..." python3 podcast_gen.py document.md
+
+# Use a specific API endpoint
+python3 podcast_gen.py document.md --api-url http://localhost:11434/v1/chat/completions
+
+# Generate script only (no TTS)
+python3 podcast_gen.py document.md --script-only
+
+# Re-synthesize from existing script
+python3 podcast_gen.py document.md --from-script document.podcast-script.txt
+
+# Specify model
+python3 podcast_gen.py document.md --model claude-opus-4.6
+```
+
+### Performance
+
+- **Script generation**: 10-40s depending on LLM provider and document length
+- **TTS synthesis**: ~1.6x realtime on CPU (a 3-min podcast takes ~5 min to generate)
+- **Output**: MP3 at 128kbps, typically 2-6 min for a standard document
+- No GPU required — runs entirely on CPU
+
+### Custom Model Paths
+
+Override default model locations with environment variables:
+
+```bash
+export KOKORO_MODEL="/path/to/kokoro-v1.0.onnx"
+export KOKORO_VOICES="/path/to/voices-v1.0.bin"
+```

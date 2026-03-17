@@ -651,7 +651,9 @@ func (a *app) generatePodcast(relPath string, job *podcastJob) {
 	}
 
 	cmd := exec.Command("python3", scriptPath, fullPath, "-o", mp3Path)
-	cmd.Env = append(os.Environ(), fmt.Sprintf("OPENCLAW_TOKEN=%s", os.Getenv("OPENCLAW_TOKEN")))
+	// Pass through all env vars — podcast_gen.py auto-detects provider from
+	// PODCAST_API_URL, PODCAST_API_TOKEN, OPENCLAW_TOKEN, OPENAI_API_KEY, ANTHROPIC_API_KEY
+	cmd.Env = os.Environ()
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
