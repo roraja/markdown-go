@@ -8,10 +8,14 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"bufio"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 )
 
 const mdviewerFile = ".mdviewer"
@@ -28,6 +32,18 @@ var validTags = map[string]bool{
 type app struct {
 	root string
 	tpl  *template.Template
+
+	// Podcast generation state
+	podcastMu    sync.Mutex
+	podcastJobs  map[string]*podcastJob // keyed by relative md path
+}
+
+type podcastJob struct {
+	Status   string   `json:"status"`   // "generating", "done", "error"
+	Progress int      `json:"progress"` // 0-100
+	Error    string   `json:"error,omitempty"`
+	Output   string   `json:"output,omitempty"` // relative path to mp3
+	Lines    []string `json:"lines,omitempty"`  // live log lines
 }
 
 type pageData struct {
@@ -165,7 +181,7 @@ func main() {
 		log.Fatalf("parse template: %v", err)
 	}
 
-	a := &app{root: absRoot, tpl: tpl}
+	a := &app{root: absRoot, tpl: tpl, podcastJobs: make(map[string]*podcastJob)}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", a.handleIndex)
 	mux.HandleFunc("/api/files", a.handleFiles)
@@ -177,6 +193,7 @@ func main() {
 	mux.HandleFunc("/api/archive", a.handleArchive)
 	mux.HandleFunc("/api/save", a.handleSave)
 	mux.HandleFunc("/api/media/", a.handleMedia)
+	mux.HandleFunc("/api/podcast", a.handlePodcast)
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
@@ -514,6 +531,176 @@ func (a *app) handleMedia(w http.ResponseWriter, r *http.Request) {
 	}
 
 	http.ServeFile(w, r, fullPath)
+}
+
+func (a *app) handlePodcast(w http.ResponseWriter, r *http.Request) {
+	filePath := r.URL.Query().Get("path")
+	if filePath == "" {
+		http.Error(w, "missing path", http.StatusBadRequest)
+		return
+	}
+
+	relPath, err := sanitizeRelativePath(filePath)
+	if err != nil {
+		http.Error(w, "invalid path", http.StatusBadRequest)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+
+	switch r.Method {
+	case http.MethodGet:
+		// Check status or serve existing podcast
+		a.podcastMu.Lock()
+		job, exists := a.podcastJobs[relPath]
+		a.podcastMu.Unlock()
+
+		if exists {
+			_ = json.NewEncoder(w).Encode(job)
+			return
+		}
+
+		// Check if mp3 already exists on disk
+		mp3Path := a.podcastMP3Path(relPath)
+		if _, err := os.Stat(mp3Path); err == nil {
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"status": "done",
+				"output": a.podcastMP3RelPath(relPath),
+			})
+			return
+		}
+
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "none"})
+
+	case http.MethodPost:
+		// Start generation
+		a.podcastMu.Lock()
+		if job, exists := a.podcastJobs[relPath]; exists && job.Status == "generating" {
+			a.podcastMu.Unlock()
+			_ = json.NewEncoder(w).Encode(job)
+			return
+		}
+
+		job := &podcastJob{Status: "generating", Progress: 0}
+		a.podcastJobs[relPath] = job
+		a.podcastMu.Unlock()
+
+		go a.generatePodcast(relPath, job)
+
+		_ = json.NewEncoder(w).Encode(job)
+
+	case http.MethodDelete:
+		// Delete cached podcast
+		mp3Path := a.podcastMP3Path(relPath)
+		scriptPath := a.podcastScriptPath(relPath)
+		_ = os.Remove(mp3Path)
+		_ = os.Remove(scriptPath)
+		a.podcastMu.Lock()
+		delete(a.podcastJobs, relPath)
+		a.podcastMu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "deleted"})
+
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (a *app) podcastMP3Path(relPath string) string {
+	ext := filepath.Ext(relPath)
+	base := relPath[:len(relPath)-len(ext)]
+	return filepath.Join(a.root, base+".podcast.mp3")
+}
+
+func (a *app) podcastScriptPath(relPath string) string {
+	ext := filepath.Ext(relPath)
+	base := relPath[:len(relPath)-len(ext)]
+	return filepath.Join(a.root, base+".podcast-script.txt")
+}
+
+func (a *app) podcastMP3RelPath(relPath string) string {
+	ext := filepath.Ext(relPath)
+	base := relPath[:len(relPath)-len(ext)]
+	return base + ".podcast.mp3"
+}
+
+func (a *app) generatePodcast(relPath string, job *podcastJob) {
+	fullPath := filepath.Join(a.root, relPath)
+	mp3Path := a.podcastMP3Path(relPath)
+
+	// Find podcast_gen.py next to the binary, or in known locations
+	scriptLocations := []string{
+		filepath.Join(filepath.Dir(os.Args[0]), "podcast_gen.py"),
+		"/usr/local/share/mdviewer/podcast_gen.py",
+		filepath.Join(os.Getenv("HOME"), "src", "markdown-go", "podcast_gen.py"),
+	}
+
+	var scriptPath string
+	for _, loc := range scriptLocations {
+		if _, err := os.Stat(loc); err == nil {
+			scriptPath = loc
+			break
+		}
+	}
+
+	if scriptPath == "" {
+		a.podcastMu.Lock()
+		job.Status = "error"
+		job.Error = "podcast_gen.py not found"
+		a.podcastMu.Unlock()
+		return
+	}
+
+	cmd := exec.Command("python3", scriptPath, fullPath, "-o", mp3Path)
+	cmd.Env = append(os.Environ(), fmt.Sprintf("OPENCLAW_TOKEN=%s", os.Getenv("OPENCLAW_TOKEN")))
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		a.podcastMu.Lock()
+		job.Status = "error"
+		job.Error = err.Error()
+		a.podcastMu.Unlock()
+		return
+	}
+	cmd.Stderr = cmd.Stdout
+
+	if err := cmd.Start(); err != nil {
+		a.podcastMu.Lock()
+		job.Status = "error"
+		job.Error = err.Error()
+		a.podcastMu.Unlock()
+		return
+	}
+
+	scanner := bufio.NewScanner(stdout)
+	for scanner.Scan() {
+		line := scanner.Text()
+		a.podcastMu.Lock()
+		job.Lines = append(job.Lines, line)
+		// Parse progress from [tts] NN% lines
+		if strings.HasPrefix(line, "[tts]") {
+			var pct int
+			if _, err := fmt.Sscanf(line, "[tts] %d%%", &pct); err == nil {
+				job.Progress = pct
+			}
+		}
+		a.podcastMu.Unlock()
+	}
+
+	if err := cmd.Wait(); err != nil {
+		a.podcastMu.Lock()
+		job.Status = "error"
+		job.Error = fmt.Sprintf("podcast_gen.py failed: %v", err)
+		a.podcastMu.Unlock()
+		return
+	}
+
+	a.podcastMu.Lock()
+	job.Status = "done"
+	job.Progress = 100
+	job.Output = a.podcastMP3RelPath(relPath)
+	a.podcastMu.Unlock()
+
+	log.Printf("Podcast generated: %s", mp3Path)
 }
 
 func (a *app) handleSave(w http.ResponseWriter, r *http.Request) {
@@ -1344,6 +1531,9 @@ const indexHTML = `<!DOCTYPE html>
           <button id="save-btn" class="btn hidden" type="button" style="background:#238636;border-color:#238636;color:#fff;">💾 Save</button>
           <button id="cancel-edit-btn" class="btn hidden" type="button">Cancel</button>
           <button id="archive-btn" class="btn" type="button" title="Move all ARCHIVE-tagged files to .archive folder">&#128230; Archive</button>
+          <button id="podcast-btn" class="btn hidden" type="button" title="Generate podcast from this document">🎙️ Podcast</button>
+          <span id="podcast-status" class="hidden" style="margin-left:8px; font-size:13px; color:#8b949e;"></span>
+          <audio id="podcast-player" class="hidden" controls style="margin-left:8px; height:30px; vertical-align:middle;"></audio>
         </div>
       </div>
       <section class="viewer">
@@ -2383,7 +2573,90 @@ const indexHTML = `<!DOCTYPE html>
       attachCheckboxHandlers();
       editBtn.classList.remove('hidden');
       if (editMode) exitEditMode();
+      checkPodcastStatus(filePath);
     };
+
+    // ---- Podcast ----
+    const podcastBtn = document.getElementById('podcast-btn');
+    const podcastStatus = document.getElementById('podcast-status');
+    const podcastPlayer = document.getElementById('podcast-player');
+    let podcastPollTimer = null;
+
+    async function checkPodcastStatus(filePath) {
+      if (!filePath || !filePath.endsWith('.md')) {
+        podcastBtn.classList.add('hidden');
+        podcastPlayer.classList.add('hidden');
+        podcastStatus.classList.add('hidden');
+        return;
+      }
+      podcastBtn.classList.remove('hidden');
+
+      try {
+        const resp = await fetch('/api/podcast?path=' + encodeURIComponent(filePath));
+        const data = await resp.json();
+
+        if (data.status === 'done' && data.output) {
+          podcastBtn.textContent = '🎙️ Regenerate';
+          podcastPlayer.classList.remove('hidden');
+          podcastPlayer.src = '/api/media/' + data.output;
+          podcastStatus.classList.add('hidden');
+          stopPodcastPoll();
+        } else if (data.status === 'generating') {
+          podcastBtn.textContent = '🎙️ Generating...';
+          podcastBtn.disabled = true;
+          podcastStatus.textContent = data.progress + '%';
+          podcastStatus.classList.remove('hidden');
+          podcastPlayer.classList.add('hidden');
+          startPodcastPoll(filePath);
+        } else {
+          podcastBtn.textContent = '🎙️ Podcast';
+          podcastBtn.disabled = false;
+          podcastPlayer.classList.add('hidden');
+          podcastStatus.classList.add('hidden');
+          stopPodcastPoll();
+        }
+      } catch (e) {
+        podcastBtn.textContent = '🎙️ Podcast';
+        podcastBtn.disabled = false;
+      }
+    }
+
+    function startPodcastPoll(filePath) {
+      stopPodcastPoll();
+      podcastPollTimer = setInterval(() => checkPodcastStatus(filePath), 3000);
+    }
+
+    function stopPodcastPoll() {
+      if (podcastPollTimer) {
+        clearInterval(podcastPollTimer);
+        podcastPollTimer = null;
+      }
+    }
+
+    podcastBtn.addEventListener('click', async () => {
+      if (!activeFile) return;
+
+      // If podcast exists, confirm regeneration
+      if (podcastBtn.textContent.includes('Regenerate')) {
+        if (!confirm('Regenerate podcast? This will replace the existing one.')) return;
+        await fetch('/api/podcast?path=' + encodeURIComponent(activeFile), { method: 'DELETE' });
+      }
+
+      podcastBtn.textContent = '🎙️ Starting...';
+      podcastBtn.disabled = true;
+      podcastStatus.textContent = '0%';
+      podcastStatus.classList.remove('hidden');
+      podcastPlayer.classList.add('hidden');
+
+      try {
+        await fetch('/api/podcast?path=' + encodeURIComponent(activeFile), { method: 'POST' });
+        startPodcastPoll(activeFile);
+      } catch (e) {
+        podcastBtn.textContent = '🎙️ Podcast';
+        podcastBtn.disabled = false;
+        podcastStatus.textContent = 'Error: ' + e.message;
+      }
+    });
 
   </script>
 </body>
