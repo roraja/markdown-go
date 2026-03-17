@@ -2576,6 +2576,9 @@ const indexHTML = `<!DOCTYPE html>
       checkPodcastStatus(filePath);
     };
 
+    // Trigger podcast check for the initially loaded file
+    if (activeFile) checkPodcastStatus(activeFile);
+
     // ---- Podcast ----
     const podcastBtn = document.getElementById('podcast-btn');
     const podcastStatus = document.getElementById('podcast-status');
