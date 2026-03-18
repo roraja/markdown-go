@@ -2163,6 +2163,15 @@ const indexHTML = `<!DOCTYPE html>
         return '<img src="' + href + '" alt="' + (text || '') + '"' + titleAttr + ' />';
       };
 
+      // Generate heading IDs for TOC anchor links
+      const origHeading = renderer.heading.bind(renderer);
+      renderer.heading = function({ text, depth }) {
+        // Strip HTML tags to get raw text for slug
+        const raw = text.replace(/<[^>]*>/g, '');
+        const slug = raw.toLowerCase().replace(/[^\w\s-]/g, '').replace(/\s+/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
+        return '<h' + depth + ' id="' + slug + '"><a class="anchor" href="#' + slug + '"></a>' + text + '</h' + depth + '>\n';
+      };
+
       let html = marked.parse(markdown, { gfm: true, renderer: renderer });
       html = html.replace(/<pre><code class="language-mermaid">([\s\S]*?)<\/code><\/pre>/g, (_, code) => {
         return '<div class="mermaid-block"><div class="mermaid">' + decodeHTML(code) + '</div></div>';

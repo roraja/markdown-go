@@ -2,6 +2,23 @@
 
 A lightweight local web app to browse and render Markdown files (`.md`, `.markdown`) from a folder.
 
+## Quick Install
+
+**macOS / Linux:**
+```bash
+curl -fsSL https://raw.githubusercontent.com/roraja/markdown-go/master/install.sh | sh
+```
+
+**Windows (PowerShell):**
+```powershell
+iex (iwr 'https://raw.githubusercontent.com/roraja/markdown-go/master/install.ps1').Content
+```
+
+Then run:
+```bash
+mdviewer -root ~/your-notes -port 8080
+```
+
 ## Requirements
 
 - Go 1.22+
