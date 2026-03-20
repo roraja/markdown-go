@@ -1843,6 +1843,7 @@ const indexHTML = `<!DOCTYPE html>
           files = allFiles;
         }
         renderFileList();
+        _lastFileHash = fileListHash(files) + JSON.stringify(Object.values(fileMeta));
 
         applySidebarVisibility(isFullscreenMode(params), false);
         const requested = params.get('file') || INITIAL_FILE;
@@ -1857,6 +1858,39 @@ const indexHTML = `<!DOCTYPE html>
         renderedEl.innerHTML = '<div class="muted">Failed to load markdown files.</div>';
       }
     }
+
+    // Live-update sidebar: poll /api/files every 5s, re-render only if changed
+    let _lastFileHash = '';
+    function fileListHash(arr) { return arr.join('\n'); }
+    async function pollFiles() {
+      try {
+        const [filesResp, tagsResp] = await Promise.all([fetch('/api/files'), fetch('/api/tags')]);
+        if (!filesResp.ok) return;
+        const payload = await filesResp.json();
+        let allFiles = payload.files || [];
+        if (payload.meta) {
+          for (const m of payload.meta) {
+            fileMeta[m.path] = { modifiedAt: m.modifiedAt, createdAt: m.createdAt };
+          }
+        }
+        if (baseFolderPath) {
+          const prefix = baseFolderPath + '/';
+          allFiles = allFiles.filter(f => f.startsWith(prefix) || f === baseFolderPath);
+        }
+        const h = fileListHash(allFiles) + JSON.stringify(payload.meta || []);
+        if (h !== _lastFileHash) {
+          _lastFileHash = h;
+          files = allFiles;
+          if (tagsResp.ok) {
+            const tp = await tagsResp.json();
+            fileTags = tp.tags || {};
+            fileOpened = tp.opened || {};
+          }
+          if (!searchMode) renderFileList();
+        }
+      } catch (_) {}
+    }
+    setInterval(pollFiles, 5000);
 
     function buildTree(filePaths) {
       const root = { name: '', children: {}, files: [] };

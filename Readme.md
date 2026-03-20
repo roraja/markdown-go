@@ -90,6 +90,8 @@ Then run the installed binary from your Go bin directory (for example `$(go env 
 3. Select a Markdown file from the left sidebar.
 4. Use **Hide Sidebar** for full-width reading, or toggle to **Show Raw**.
 
+The sidebar **live-updates** every 5 seconds — new files, deletions, and modification time changes appear automatically without refreshing the page.
+
 ## Options
 
 - `-root` (default `.`): Root directory scanned recursively for Markdown files.
