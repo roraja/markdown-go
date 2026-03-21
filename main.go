@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 const mdviewerFile = ".mdviewer"
@@ -627,6 +628,21 @@ func (a *app) generatePodcast(relPath string, job *podcastJob) {
 	fullPath := filepath.Join(a.root, relPath)
 	mp3Path := a.podcastMP3Path(relPath)
 
+	// Ensure log directory exists
+	logDir := filepath.Join(os.Getenv("HOME"), ".mdviewer", "logs")
+	os.MkdirAll(logDir, 0755)
+	logFile := filepath.Join(logDir, "podcast.log")
+
+	appendLog := func(msg string) {
+		f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err == nil {
+			fmt.Fprintf(f, "[%s] [%s] %s\n", time.Now().Format("2006-01-02 15:04:05"), relPath, msg)
+			f.Close()
+		}
+	}
+
+	appendLog("Starting podcast generation")
+
 	// Find podcast_gen.py next to the binary, or in known locations
 	scriptLocations := []string{
 		filepath.Join(filepath.Dir(os.Args[0]), "podcast_gen.py"),
@@ -643,6 +659,7 @@ func (a *app) generatePodcast(relPath string, job *podcastJob) {
 	}
 
 	if scriptPath == "" {
+		appendLog("ERROR: podcast_gen.py not found in any search path")
 		a.podcastMu.Lock()
 		job.Status = "error"
 		job.Error = "podcast_gen.py not found"
@@ -650,13 +667,26 @@ func (a *app) generatePodcast(relPath string, job *podcastJob) {
 		return
 	}
 
+	appendLog(fmt.Sprintf("Using script: %s", scriptPath))
+
 	cmd := exec.Command("python3", scriptPath, fullPath, "-o", mp3Path)
 	// Pass through all env vars — podcast_gen.py auto-detects provider from
 	// PODCAST_API_URL, PODCAST_API_TOKEN, OPENCLAW_TOKEN, OPENAI_API_KEY, ANTHROPIC_API_KEY
 	cmd.Env = os.Environ()
 
+	// Log env vars relevant to podcast generation (redacted)
+	for _, key := range []string{"PODCAST_API_URL", "PODCAST_API_TOKEN", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"} {
+		val := os.Getenv(key)
+		if val != "" {
+			appendLog(fmt.Sprintf("Env %s=<set> (len=%d)", key, len(val)))
+		} else {
+			appendLog(fmt.Sprintf("Env %s=<not set>", key))
+		}
+	}
+
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		appendLog(fmt.Sprintf("ERROR: stdout pipe: %v", err))
 		a.podcastMu.Lock()
 		job.Status = "error"
 		job.Error = err.Error()
@@ -666,6 +696,7 @@ func (a *app) generatePodcast(relPath string, job *podcastJob) {
 	cmd.Stderr = cmd.Stdout
 
 	if err := cmd.Start(); err != nil {
+		appendLog(fmt.Sprintf("ERROR: cmd start: %v", err))
 		a.podcastMu.Lock()
 		job.Status = "error"
 		job.Error = err.Error()
@@ -673,9 +704,12 @@ func (a *app) generatePodcast(relPath string, job *podcastJob) {
 		return
 	}
 
+	appendLog(fmt.Sprintf("Process started PID=%d", cmd.Process.Pid))
+
 	scanner := bufio.NewScanner(stdout)
 	for scanner.Scan() {
 		line := scanner.Text()
+		appendLog(fmt.Sprintf("OUT: %s", line))
 		a.podcastMu.Lock()
 		job.Lines = append(job.Lines, line)
 		// Parse progress from [tts] NN% lines
@@ -689,12 +723,15 @@ func (a *app) generatePodcast(relPath string, job *podcastJob) {
 	}
 
 	if err := cmd.Wait(); err != nil {
+		appendLog(fmt.Sprintf("ERROR: process exited: %v", err))
 		a.podcastMu.Lock()
 		job.Status = "error"
 		job.Error = fmt.Sprintf("podcast_gen.py failed: %v", err)
 		a.podcastMu.Unlock()
 		return
 	}
+
+	appendLog(fmt.Sprintf("SUCCESS: generated %s", mp3Path))
 
 	a.podcastMu.Lock()
 	job.Status = "done"
