@@ -164,6 +164,7 @@ func collectAllTags(root string) (allTagsResult, error) {
 func main() {
 	rootFlag := flag.String("root", ".", "Root directory to scan for markdown files")
 	portFlag := flag.String("port", "8080", "HTTP port to listen on")
+	podcastWatchFlag := flag.String("podcast-watch", "", "Comma-separated list of directories (relative to -root) to watch for auto podcast generation")
 	flag.Parse()
 
 	absRoot, err := filepath.Abs(*rootFlag)
@@ -204,6 +205,14 @@ func main() {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	})
+
+	if *podcastWatchFlag != "" {
+		dirs := strings.Split(*podcastWatchFlag, ",")
+		for i := range dirs {
+			dirs[i] = strings.TrimSpace(dirs[i])
+		}
+		go a.startPodcastWatcher(dirs)
+	}
 
 	addr := ":" + *portFlag
 	log.Printf("Markdown viewer running on http://localhost%s (root: %s)", addr, absRoot)
@@ -745,6 +754,134 @@ func (a *app) generatePodcast(relPath string, job *podcastJob) {
 	a.podcastMu.Unlock()
 
 	log.Printf("Podcast generated: %s", mp3Path)
+}
+
+// --- Podcast Auto-Watch ---
+
+func (a *app) startPodcastWatcher(dirs []string) {
+	stateFile := filepath.Join(os.Getenv("HOME"), ".mdviewer", "podcast-watch-state.json")
+	os.MkdirAll(filepath.Dir(stateFile), 0755)
+
+	// State: map of relPath -> mod time (unix)
+	known := make(map[string]int64)
+
+	// Load existing state
+	if data, err := os.ReadFile(stateFile); err == nil {
+		json.Unmarshal(data, &known)
+	}
+
+	saveState := func() {
+		data, _ := json.Marshal(known)
+		os.WriteFile(stateFile, data, 0644)
+	}
+
+	log.Printf("[podcast-watch] Starting auto-podcast watcher for directories: %v", dirs)
+
+	// Queue for serial generation
+	queue := make(chan string, 1000)
+
+	// Worker: generate one at a time
+	go func() {
+		for relPath := range queue {
+			log.Printf("[podcast-watch] Starting podcast generation for: %s", relPath)
+			job := &podcastJob{Status: "generating", Progress: 0}
+			a.podcastMu.Lock()
+			a.podcastJobs[relPath] = job
+			a.podcastMu.Unlock()
+
+			a.generatePodcast(relPath, job)
+
+			a.podcastMu.Lock()
+			status := job.Status
+			a.podcastMu.Unlock()
+
+			if status == "done" {
+				log.Printf("[podcast-watch] Completed podcast for: %s", relPath)
+			} else {
+				log.Printf("[podcast-watch] Failed podcast for %s: %s", relPath, job.Error)
+			}
+		}
+	}()
+
+	// Initial scan + periodic re-scan
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	scan := func() {
+		for _, dir := range dirs {
+			absDir := filepath.Join(a.root, dir)
+			filepath.WalkDir(absDir, func(path string, d fs.DirEntry, err error) error {
+				if err != nil || d.IsDir() {
+					return nil
+				}
+				if !strings.HasSuffix(path, ".md") {
+					return nil
+				}
+				// Skip hidden files and podcast scripts
+				base := filepath.Base(path)
+				if strings.HasPrefix(base, ".") || strings.HasSuffix(path, ".podcast-script.txt") {
+					return nil
+				}
+
+				relPath, err := filepath.Rel(a.root, path)
+				if err != nil {
+					return nil
+				}
+				relPath = filepath.ToSlash(relPath)
+
+				info, err := d.Info()
+				if err != nil {
+					return nil
+				}
+				modTime := info.ModTime().Unix()
+
+				mp3Path := a.podcastMP3Path(relPath)
+				mp3Info, mp3Err := os.Stat(mp3Path)
+
+				needsGen := false
+				if mp3Err != nil {
+					// No mp3 exists
+					if _, seen := known[relPath]; !seen {
+						needsGen = true
+						log.Printf("[podcast-watch] New file detected: %s", relPath)
+					}
+				} else {
+					// mp3 exists but md is newer
+					if modTime > mp3Info.ModTime().Unix() {
+						needsGen = true
+						log.Printf("[podcast-watch] File modified since last podcast: %s", relPath)
+					}
+				}
+
+				known[relPath] = modTime
+
+				if needsGen {
+					// Don't queue if already generating
+					a.podcastMu.Lock()
+					existing, exists := a.podcastJobs[relPath]
+					busy := exists && existing.Status == "generating"
+					a.podcastMu.Unlock()
+
+					if !busy {
+						log.Printf("[podcast-watch] Queuing podcast generation for: %s", relPath)
+						select {
+						case queue <- relPath:
+						default:
+							log.Printf("[podcast-watch] Queue full, skipping: %s", relPath)
+						}
+					}
+				}
+
+				return nil
+			})
+		}
+		saveState()
+	}
+
+	scan()
+	for range ticker.C {
+		scan()
+	}
 }
 
 func (a *app) handleSave(w http.ResponseWriter, r *http.Request) {
