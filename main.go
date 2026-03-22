@@ -199,6 +199,7 @@ func main() {
 	mux.HandleFunc("/podcasts", a.handlePodcasts)
 	mux.HandleFunc("/api/podcasts", a.handlePodcastList)
 	mux.HandleFunc("/api/podcasts/progress", a.handlePodcastProgress)
+	mux.HandleFunc("/api/podcasts/queue", a.handlePodcastQueue)
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
@@ -1047,6 +1048,44 @@ func (a *app) handlePodcastProgress(w http.ResponseWriter, r *http.Request) {
 		}
 		// Validate JSON
 		var check map[string]interface{}
+		if json.Unmarshal(body, &check) != nil {
+			http.Error(w, "invalid json", 400)
+			return
+		}
+		os.WriteFile(fp, body, 0644)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"ok":true}`)
+	default:
+		http.Error(w, "method not allowed", 405)
+	}
+}
+
+func podcastQueueFile() string {
+	home, _ := os.UserHomeDir()
+	dir := filepath.Join(home, ".mdviewer")
+	os.MkdirAll(dir, 0755)
+	return filepath.Join(dir, "podcast-queue.json")
+}
+
+func (a *app) handlePodcastQueue(w http.ResponseWriter, r *http.Request) {
+	fp := podcastQueueFile()
+	switch r.Method {
+	case http.MethodGet:
+		data, err := os.ReadFile(fp)
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, "[]")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(data)
+	case http.MethodPost:
+		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		if err != nil {
+			http.Error(w, "read error", 400)
+			return
+		}
+		var check []interface{}
 		if json.Unmarshal(body, &check) != nil {
 			http.Error(w, "invalid json", 400)
 			return
@@ -2857,55 +2896,114 @@ const podcastsHTML = `<!DOCTYPE html>
 <meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no"/>
 <title>Podcasts – Markdown Viewer</title>
 <style>
-:root{--bg:#0d1117;--panel:#161b22;--border:#30363d;--text:#c9d1d9;--muted:#8b949e;--link:#58a6ff;--active:#1f6feb33;--sidebar-bg:#010409;--button-bg:#21262d;--button-hover:#30363d}
-@media(prefers-color-scheme:light){:root{--bg:#f6f8fa;--panel:#ffffff;--border:#d0d7de;--text:#1f2328;--muted:#656d76;--link:#0969da;--active:#0969da1a;--sidebar-bg:#f0f0f0;--button-bg:#e8e8e8;--button-hover:#d0d7de}}
+:root{--bg:#0d1117;--panel:#161b22;--border:#30363d;--text:#c9d1d9;--muted:#8b949e;--link:#58a6ff;--active:#1f6feb33;--sidebar-bg:#010409;--button-bg:#21262d;--button-hover:#30363d;--card-bg:#161b22;--card-border:#21262d;--card-shadow:0 1px 3px rgba(0,0,0,0.3);--success:#3fb950;--warn:#d29922}
+@media(prefers-color-scheme:light){:root{--bg:#f6f8fa;--panel:#ffffff;--border:#d0d7de;--text:#1f2328;--muted:#656d76;--link:#0969da;--active:#0969da1a;--sidebar-bg:#f0f0f0;--button-bg:#e8e8e8;--button-hover:#d0d7de;--card-bg:#ffffff;--card-border:#d0d7de;--card-shadow:0 1px 3px rgba(0,0,0,0.08);--success:#1a7f37;--warn:#9a6700}}
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;padding-bottom:160px}
 .header{padding:16px;display:flex;align-items:center;gap:12px;border-bottom:1px solid var(--border);background:var(--panel);position:sticky;top:0;z-index:10}
 .header h1{font-size:1.2em;flex:1}
 .header a{color:var(--link);text-decoration:none;font-size:0.9em}
-.tabs{display:flex;border-bottom:1px solid var(--border);background:var(--panel);position:sticky;top:53px;z-index:9}
-.tab{flex:1;padding:12px;text-align:center;cursor:pointer;color:var(--muted);font-size:0.9em;border-bottom:2px solid transparent}
+
+/* Search */
+.search-bar{padding:12px 16px;background:var(--panel);border-bottom:1px solid var(--border);position:sticky;top:53px;z-index:10}
+.search-wrap{display:flex;align-items:center;background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:0 12px;gap:8px;transition:border-color 0.2s}
+.search-wrap:focus-within{border-color:var(--link)}
+.search-wrap svg{width:16px;height:16px;color:var(--muted);flex-shrink:0}
+.search-input{flex:1;border:none;background:none;color:var(--text);font-size:0.95em;padding:10px 0;outline:none}
+.search-input::placeholder{color:var(--muted)}
+.search-clear{width:28px;height:28px;border:none;background:none;color:var(--muted);cursor:pointer;font-size:1.1em;display:none;align-items:center;justify-content:center;border-radius:50%}
+.search-clear:hover{background:var(--button-hover)}
+.search-clear.visible{display:flex}
+
+.tabs{display:flex;border-bottom:1px solid var(--border);background:var(--panel);position:sticky;top:109px;z-index:9}
+.tab{flex:1;padding:12px;text-align:center;cursor:pointer;color:var(--muted);font-size:0.9em;border-bottom:2px solid transparent;transition:color 0.2s,border-color 0.2s}
 .tab.active{color:var(--link);border-bottom-color:var(--link)}
-.library,.queue-view{padding:8px}
-.folder-group{margin-bottom:16px}
-.folder-name{font-size:0.8em;color:var(--muted);padding:8px 12px;text-transform:uppercase;letter-spacing:0.5px}
-.podcast-item{display:flex;align-items:center;padding:12px;border-radius:8px;cursor:pointer;gap:12px;min-height:56px}
-.podcast-item:active,.podcast-item:hover{background:var(--active)}
-.podcast-item.playing{background:var(--active)}
-.podcast-icon{width:40px;height:40px;border-radius:8px;background:var(--button-bg);display:flex;align-items:center;justify-content:center;font-size:1.2em;flex-shrink:0}
+
+.content-area{padding:8px}
+
+/* Section headers */
+.section-header{font-size:0.85em;font-weight:600;color:var(--muted);padding:16px 12px 8px;text-transform:uppercase;letter-spacing:0.5px;display:flex;align-items:center;gap:8px}
+.section-header .count{font-weight:400;font-size:0.9em;opacity:0.7}
+
+/* Cards */
+.podcast-card{display:flex;align-items:center;padding:12px;border-radius:12px;cursor:pointer;gap:12px;min-height:64px;margin:4px 8px;background:var(--card-bg);border:1px solid var(--card-border);box-shadow:var(--card-shadow);transition:transform 0.15s,box-shadow 0.15s}
+.podcast-card:active{transform:scale(0.98)}
+.podcast-card:hover{box-shadow:0 2px 8px rgba(0,0,0,0.15)}
+.podcast-card.playing{border-color:var(--link);box-shadow:0 0 0 1px var(--link),var(--card-shadow)}
+
+/* Album art placeholder */
+.podcast-art{width:48px;height:48px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:1.4em;flex-shrink:0;color:#fff;position:relative}
+.podcast-art .playing-indicator{position:absolute;bottom:2px;right:2px;width:12px;height:12px;background:var(--link);border-radius:50%;border:2px solid var(--card-bg);animation:pulse 1.5s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.5}}
+
 .podcast-info{flex:1;min-width:0}
-.podcast-name{font-size:0.95em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.podcast-name{font-size:0.95em;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .podcast-meta{font-size:0.75em;color:var(--muted);margin-top:2px}
+
+/* Progress bar in cards */
+.podcast-progress{height:3px;background:var(--border);border-radius:2px;margin-top:6px;overflow:hidden;position:relative}
+.podcast-progress-fill{height:100%;border-radius:2px;transition:width 0.3s}
+.podcast-progress-fill.partial{background:var(--link)}
+.podcast-progress-fill.complete{background:var(--success)}
+.podcast-badge{font-size:0.7em;color:var(--success);margin-left:4px;font-weight:600}
+
 .podcast-actions{display:flex;gap:4px}
-.add-queue-btn{width:36px;height:36px;border:none;background:var(--button-bg);color:var(--text);border-radius:50%;cursor:pointer;font-size:1em;display:flex;align-items:center;justify-content:center}
+.add-queue-btn{width:36px;height:36px;border:none;background:var(--button-bg);color:var(--text);border-radius:50%;cursor:pointer;font-size:1em;display:flex;align-items:center;justify-content:center;transition:background 0.15s}
 .add-queue-btn:hover{background:var(--button-hover)}
+
+/* Recently played resume btn */
+.resume-btn{padding:6px 14px;border:none;background:var(--link);color:#fff;border-radius:8px;cursor:pointer;font-size:0.8em;font-weight:500;white-space:nowrap;transition:opacity 0.15s}
+.resume-btn:hover{opacity:0.85}
+
+/* Folder groups */
+.folder-group{margin-bottom:8px}
+.folder-name{font-size:0.8em;color:var(--muted);padding:8px 12px;text-transform:uppercase;letter-spacing:0.5px}
+
 /* Queue */
-.queue-item{display:flex;align-items:center;padding:12px;border-radius:8px;gap:12px;min-height:56px;cursor:grab}
+.queue-item{display:flex;align-items:center;padding:12px;border-radius:12px;gap:12px;min-height:56px;cursor:grab;margin:4px 8px;background:var(--card-bg);border:1px solid var(--card-border);box-shadow:var(--card-shadow);transition:transform 0.15s,opacity 0.2s}
 .queue-item.dragging{opacity:0.4}
-.queue-item .drag-handle{color:var(--muted);cursor:grab;font-size:1.2em}
-.queue-item .remove-btn{width:32px;height:32px;border:none;background:none;color:var(--muted);cursor:pointer;font-size:1em}
-.queue-empty{text-align:center;padding:48px 16px;color:var(--muted)}
+.queue-item .drag-handle{color:var(--muted);cursor:grab;font-size:1.2em;padding:4px}
+.queue-item .remove-btn{width:32px;height:32px;border:none;background:none;color:var(--muted);cursor:pointer;font-size:1em;border-radius:50%;transition:color 0.15s,background 0.15s}
+.queue-item .remove-btn:hover{color:var(--text);background:var(--button-hover)}
+.empty-state{text-align:center;padding:48px 16px;color:var(--muted)}
+.empty-state .empty-icon{font-size:2.5em;margin-bottom:12px;opacity:0.5}
+.empty-state .empty-text{font-size:0.95em}
+.empty-state .empty-sub{font-size:0.8em;margin-top:6px;opacity:0.7}
+
+/* Skeleton loading */
+.skeleton{padding:8px}
+.skeleton-card{display:flex;align-items:center;padding:12px;border-radius:12px;gap:12px;margin:4px 8px;background:var(--card-bg);border:1px solid var(--card-border)}
+.skeleton-art{width:48px;height:48px;border-radius:10px;background:var(--border);animation:shimmer 1.5s infinite}
+.skeleton-lines{flex:1}
+.skeleton-line{height:12px;border-radius:4px;background:var(--border);animation:shimmer 1.5s infinite;margin-bottom:6px}
+.skeleton-line:last-child{width:60%;margin-bottom:0}
+@keyframes shimmer{0%{opacity:0.5}50%{opacity:1}100%{opacity:0.5}}
+
 /* Player bar */
-.player-bar{position:fixed;bottom:0;left:0;right:0;background:var(--panel);border-top:1px solid var(--border);z-index:20;display:none;flex-direction:column}
+.player-bar{position:fixed;bottom:0;left:0;right:0;background:var(--panel);border-top:1px solid var(--border);z-index:20;display:none;flex-direction:column;transition:transform 0.3s}
 .player-bar.visible{display:flex}
-.progress-container{width:100%;height:4px;background:var(--border);cursor:pointer;position:relative}
+.progress-container{width:100%;height:4px;background:var(--border);cursor:pointer;position:relative;transition:height 0.15s}
 .progress-container:hover{height:8px}
-.progress-fill{height:100%;background:var(--link);pointer-events:none;width:0%}
+.progress-fill{height:100%;background:var(--link);pointer-events:none;width:0%;transition:width 0.1s linear}
 .player-main{display:flex;align-items:center;padding:8px 12px;gap:8px}
 .player-info{flex:1;min-width:0}
 .player-title{font-size:0.85em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .player-time{font-size:0.7em;color:var(--muted)}
 .player-controls{display:flex;align-items:center;gap:4px}
-.player-btn{width:48px;height:48px;border:none;background:none;color:var(--text);cursor:pointer;font-size:1.3em;border-radius:50%;display:flex;align-items:center;justify-content:center}
+.player-btn{width:48px;height:48px;border:none;background:none;color:var(--text);cursor:pointer;font-size:1.3em;border-radius:50%;display:flex;align-items:center;justify-content:center;transition:background 0.15s}
 .player-btn:hover{background:var(--button-hover)}
 .player-btn.play-btn{font-size:1.6em}
+.speed-btn{width:40px;height:32px;border:1px solid var(--border);background:var(--button-bg);color:var(--text);cursor:pointer;font-size:0.75em;font-weight:600;border-radius:6px;display:flex;align-items:center;justify-content:center;transition:background 0.15s}
+.speed-btn:hover{background:var(--button-hover)}
+.fs-speed-btn{padding:6px 14px;border:1px solid var(--border);background:var(--button-bg);color:var(--text);cursor:pointer;font-size:0.85em;font-weight:600;border-radius:8px;transition:background 0.15s}
+.fs-speed-btn:hover{background:var(--button-hover)}
+
 /* Fullscreen player */
-.fullscreen-player{position:fixed;inset:0;background:var(--bg);z-index:30;display:none;flex-direction:column;padding:24px}
+.fullscreen-player{position:fixed;inset:0;background:var(--bg);z-index:30;display:none;flex-direction:column;padding:24px;transition:opacity 0.3s}
 .fullscreen-player.visible{display:flex}
 .fs-close{align-self:flex-start;background:none;border:none;color:var(--text);font-size:1.5em;cursor:pointer;padding:8px}
 .fs-artwork{flex:1;display:flex;align-items:center;justify-content:center}
-.fs-artwork .icon{width:200px;height:200px;border-radius:24px;background:var(--panel);display:flex;align-items:center;justify-content:center;font-size:5em}
+.fs-artwork .icon{width:200px;height:200px;border-radius:24px;display:flex;align-items:center;justify-content:center;font-size:5em;color:#fff;transition:transform 0.3s}
 .fs-info{text-align:center;padding:24px 0}
 .fs-title{font-size:1.3em;font-weight:600}
 .fs-folder{font-size:0.9em;color:var(--muted);margin-top:4px}
@@ -2914,10 +3012,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,san
 .fs-progress-fill{height:100%;background:var(--link);border-radius:3px;pointer-events:none;width:0%}
 .fs-times{display:flex;justify-content:space-between;font-size:0.75em;color:var(--muted);margin-top:6px}
 .fs-controls{display:flex;justify-content:center;align-items:center;gap:16px;padding:24px 0}
-.fs-btn{width:56px;height:56px;border:none;background:none;color:var(--text);cursor:pointer;font-size:1.5em;border-radius:50%;display:flex;align-items:center;justify-content:center}
+.fs-btn{width:56px;height:56px;border:none;background:none;color:var(--text);cursor:pointer;font-size:1.5em;border-radius:50%;display:flex;align-items:center;justify-content:center;transition:background 0.15s}
 .fs-btn:hover{background:var(--button-hover)}
 .fs-btn.play{width:72px;height:72px;font-size:2em;background:var(--link);color:#fff;border-radius:50%}
-.loading{text-align:center;padding:48px;color:var(--muted)}
+
+/* Touch swipe for queue items */
+.queue-item.swiping{transition:none}
+.queue-item.removing{transform:translateX(-100%);opacity:0;transition:transform 0.3s,opacity 0.3s}
 </style>
 </head>
 <body>
@@ -2925,12 +3026,31 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,san
   <h1>🎧 Podcasts</h1>
   <a href="/">← Back</a>
 </div>
+
+<div class="search-bar">
+  <div class="search-wrap">
+    <svg viewBox="0 0 16 16" fill="currentColor"><path d="M11.5 7a4.5 4.5 0 1 1-9 0 4.5 4.5 0 0 1 9 0Zm-.82 4.74a6 6 0 1 1 1.06-1.06l3.04 3.04a.75.75 0 1 1-1.06 1.06l-3.04-3.04Z"/></svg>
+    <input class="search-input" id="searchInput" type="text" placeholder="Search podcasts…" autocomplete="off"/>
+    <button class="search-clear" id="searchClear">✕</button>
+  </div>
+</div>
+
 <div class="tabs">
   <div class="tab active" data-tab="library">Library</div>
   <div class="tab" data-tab="queue">Queue</div>
 </div>
-<div class="library" id="library"><div class="loading">Loading podcasts…</div></div>
-<div class="queue-view" id="queueView" style="display:none"></div>
+
+<div class="content-area" id="contentArea">
+  <div id="library">
+    <div class="skeleton" id="loadingSkeleton">
+      <div class="skeleton-card"><div class="skeleton-art"></div><div class="skeleton-lines"><div class="skeleton-line"></div><div class="skeleton-line"></div></div></div>
+      <div class="skeleton-card"><div class="skeleton-art"></div><div class="skeleton-lines"><div class="skeleton-line"></div><div class="skeleton-line"></div></div></div>
+      <div class="skeleton-card"><div class="skeleton-art"></div><div class="skeleton-lines"><div class="skeleton-line"></div><div class="skeleton-line"></div></div></div>
+      <div class="skeleton-card"><div class="skeleton-art"></div><div class="skeleton-lines"><div class="skeleton-line"></div><div class="skeleton-line"></div></div></div>
+    </div>
+  </div>
+  <div id="queueView" style="display:none"></div>
+</div>
 
 <!-- Mini player bar -->
 <div class="player-bar" id="playerBar">
@@ -2944,6 +3064,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,san
       <button class="player-btn" id="btnRew">⏪</button>
       <button class="player-btn play-btn" id="btnPlay">▶️</button>
       <button class="player-btn" id="btnFwd">⏩</button>
+      <button class="speed-btn" id="btnSpeed">1x</button>
     </div>
   </div>
 </div>
@@ -2951,7 +3072,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,san
 <!-- Fullscreen player -->
 <div class="fullscreen-player" id="fsPlayer">
   <button class="fs-close" id="fsClose">✕</button>
-  <div class="fs-artwork"><div class="icon">🎙️</div></div>
+  <div class="fs-artwork"><div class="icon" id="fsArtwork">🎙️</div></div>
   <div class="fs-info">
     <div class="fs-title" id="fsTitle">—</div>
     <div class="fs-folder" id="fsFolder"></div>
@@ -2965,6 +3086,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,san
     <button class="fs-btn play" id="fsBtnPlay">▶️</button>
     <button class="fs-btn" id="fsBtnFwd">⏩</button>
   </div>
+  <div style="text-align:center;padding-bottom:16px"><button class="fs-speed-btn" id="fsBtnSpeed">1x</button></div>
 </div>
 
 <audio id="audio" preload="metadata"></audio>
@@ -2984,16 +3106,24 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,san
   const fsPlayer = document.getElementById('fsPlayer');
   const fsTitle = document.getElementById('fsTitle');
   const fsFolder = document.getElementById('fsFolder');
+  const fsArtwork = document.getElementById('fsArtwork');
   const fsCur = document.getElementById('fsCur');
   const fsDur = document.getElementById('fsDur');
   const fsProgressFill = document.getElementById('fsProgressFill');
   const fsProgressBar = document.getElementById('fsProgressBar');
   const fsBtnPlay = document.getElementById('fsBtnPlay');
+  const searchInput = document.getElementById('searchInput');
+  const searchClear = document.getElementById('searchClear');
+  const btnSpeed = document.getElementById('btnSpeed');
+  const fsBtnSpeed = document.getElementById('fsBtnSpeed');
 
+  const SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2];
   let podcasts = [];
   let currentPodcast = null;
-  let progress = {};
-  let queue = JSON.parse(localStorage.getItem('podcast-queue') || '[]');
+  let progress = {}; // {path: {time, lastPlayed, duration}, _speed: 1}
+  let queue = [];
+  let searchTerm = '';
+  let currentSpeed = 1;
 
   function fmt(s){
     if(!s||isNaN(s))return '0:00';
@@ -3002,74 +3132,221 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,san
     return m+':'+(sec<10?'0':'')+sec;
   }
 
-  function saveQueue(){ localStorage.setItem('podcast-queue', JSON.stringify(queue)); }
+  // Color from string hash for album art
+  const artColors = [
+    'linear-gradient(135deg,#667eea,#764ba2)',
+    'linear-gradient(135deg,#f093fb,#f5576c)',
+    'linear-gradient(135deg,#4facfe,#00f2fe)',
+    'linear-gradient(135deg,#43e97b,#38f9d7)',
+    'linear-gradient(135deg,#fa709a,#fee140)',
+    'linear-gradient(135deg,#a18cd1,#fbc2eb)',
+    'linear-gradient(135deg,#fccb90,#d57eeb)',
+    'linear-gradient(135deg,#e0c3fc,#8ec5fc)',
+    'linear-gradient(135deg,#f5576c,#ff6a88)',
+    'linear-gradient(135deg,#c471f5,#fa71cd)',
+    'linear-gradient(135deg,#48c6ef,#6f86d6)',
+    'linear-gradient(135deg,#feada6,#f5efef)'
+  ];
+  function hashStr(s){let h=0;for(let i=0;i<s.length;i++){h=((h<<5)-h)+s.charCodeAt(i);h|=0;}return Math.abs(h);}
+  function artBg(folder){return artColors[hashStr(folder||'root')%artColors.length];}
 
+  // --- Server-side persistence ---
   async function loadProgress(){
-    try{ const r=await fetch('/api/podcasts/progress'); progress=await r.json(); }catch(e){ progress={}; }
+    try{
+      const r=await fetch('/api/podcasts/progress');
+      const data=await r.json();
+      // Migrate old format {path: number} to new {path: {time,lastPlayed,duration}}
+      for(const[k,v] of Object.entries(data)){
+        if(typeof v==='number'){
+          data[k]={time:v,lastPlayed:0,duration:0};
+        }
+      }
+      progress=data;
+      if(progress._speed){currentSpeed=progress._speed;applySpeed();}
+    }catch(e){progress={};}
   }
 
+  let saveProgressTimer=null;
   async function saveProgress(){
     if(!currentPodcast||!audio.currentTime)return;
-    progress[currentPodcast.path]=audio.currentTime;
-    try{ await fetch('/api/podcasts/progress',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(progress)}); }catch(e){}
+    const p=progress[currentPodcast.path]||{};
+    p.time=audio.currentTime;
+    p.lastPlayed=Date.now();
+    if(audio.duration) p.duration=audio.duration;
+    progress[currentPodcast.path]=p;
+    // Debounce server writes
+    if(saveProgressTimer) return;
+    saveProgressTimer=setTimeout(async()=>{
+      saveProgressTimer=null;
+      try{await fetch('/api/podcasts/progress',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(progress)});}catch(e){}
+    },500);
+  }
+
+  async function saveProgressNow(){
+    if(!currentPodcast||!audio.currentTime)return;
+    const p=progress[currentPodcast.path]||{};
+    p.time=audio.currentTime;
+    p.lastPlayed=Date.now();
+    if(audio.duration) p.duration=audio.duration;
+    progress[currentPodcast.path]=p;
+    if(saveProgressTimer){clearTimeout(saveProgressTimer);saveProgressTimer=null;}
+    try{await fetch('/api/podcasts/progress',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(progress)});}catch(e){}
+  }
+
+  async function loadQueue(){
+    try{const r=await fetch('/api/podcasts/queue');queue=await r.json();}catch(e){queue=[];}
+  }
+
+  async function saveQueue(){
+    try{await fetch('/api/podcasts/queue',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(queue)});}catch(e){}
   }
 
   async function loadPodcasts(){
     const r=await fetch('/api/podcasts');
     podcasts=await r.json();
+    renderAll();
+  }
+
+  // --- Progress helpers ---
+  function getProgressPct(path){
+    const p=progress[path];
+    if(!p||!p.duration||p.duration<=0) return -1;
+    return Math.min(100, Math.round(p.time/p.duration*100));
+  }
+
+  function getRecentlyPlayed(){
+    return Object.entries(progress)
+      .filter(([_,v])=>v.lastPlayed>0)
+      .sort((a,b)=>b[1].lastPlayed-a[1].lastPlayed)
+      .slice(0,10)
+      .map(([path,v])=>{
+        const pod=podcasts.find(x=>x.path===path);
+        return pod?{...pod,progress:v}:null;
+      })
+      .filter(Boolean);
+  }
+
+  function matchesSearch(p){
+    if(!searchTerm)return true;
+    const t=searchTerm.toLowerCase();
+    return (p.name||'').toLowerCase().includes(t)||(p.folder||'').toLowerCase().includes(t);
+  }
+
+  // --- Render ---
+  function renderAll(){
     renderLibrary();
+    renderQueue();
+  }
+
+  function progressBarHTML(path){
+    const pct=getProgressPct(path);
+    if(pct<0) return '';
+    if(pct>=100) return '<span class="podcast-badge">✓</span>';
+    return '<div class="podcast-progress"><div class="podcast-progress-fill partial" style="width:'+pct+'%"></div></div>';
+  }
+
+  function podcastCardHTML(p,opts){
+    const playing=currentPodcast&&currentPodcast.path===p.path;
+    const d=new Date(p.modifiedAt*1000);
+    const ds=d.toLocaleDateString(undefined,{month:'short',day:'numeric',year:'numeric'});
+    const sz=(p.size/(1024*1024)).toFixed(1)+'MB';
+    const pct=getProgressPct(p.path);
+    const bg=artBg(p.folder);
+    let html='<div class="podcast-card'+(playing?' playing':'')+'" data-path="'+esc(p.path)+'">';
+    html+='<div class="podcast-art" style="background:'+bg+'">';
+    html+=(playing?'🔊':'🎙️');
+    if(playing) html+='<div class="playing-indicator"></div>';
+    html+='</div>';
+    html+='<div class="podcast-info"><div class="podcast-name">'+esc(p.name);
+    if(pct>=100) html+='<span class="podcast-badge">✓</span>';
+    html+='</div>';
+    html+='<div class="podcast-meta">'+ds+' · '+sz;
+    if(opts&&opts.showFolder&&p.folder) html+=' · '+esc(p.folder);
+    if(pct>0&&pct<100) html+=' · '+pct+'%';
+    html+='</div>';
+    if(pct>0&&pct<100) html+='<div class="podcast-progress"><div class="podcast-progress-fill partial" style="width:'+pct+'%"></div></div>';
+    html+='</div>';
+    if(opts&&opts.resume){
+      html+='<button class="resume-btn" data-path="'+esc(p.path)+'">Resume</button>';
+    }else{
+      html+='<div class="podcast-actions"><button class="add-queue-btn" data-path="'+esc(p.path)+'" title="Add to queue">+</button></div>';
+    }
+    html+='</div>';
+    return html;
   }
 
   function renderLibrary(){
     const lib=document.getElementById('library');
-    if(!podcasts.length){ lib.innerHTML='<div class="queue-empty">No podcasts found.<br>Generate podcasts from markdown files first.</div>'; return; }
-    const groups={};
-    podcasts.forEach(p=>{ const f=p.folder||'Root'; (groups[f]=groups[f]||[]).push(p); });
+    const filtered=podcasts.filter(matchesSearch);
+    const recentlyPlayed=searchTerm?[]:getRecentlyPlayed();
+
     let html='';
-    for(const[folder,items] of Object.entries(groups)){
-      html+='<div class="folder-group"><div class="folder-name">'+esc(folder)+'</div>';
-      items.forEach(p=>{
-        const d=new Date(p.modifiedAt*1000);
-        const ds=d.toLocaleDateString(undefined,{month:'short',day:'numeric',year:'numeric'});
-        const sz=(p.size/(1024*1024)).toFixed(1)+'MB';
-        const playing=currentPodcast&&currentPodcast.path===p.path;
-        html+='<div class="podcast-item'+(playing?' playing':'')+'" data-path="'+esc(p.path)+'">';
-        html+='<div class="podcast-icon">'+(playing?'🔊':'🎙️')+'</div>';
-        html+='<div class="podcast-info"><div class="podcast-name">'+esc(p.name)+'</div><div class="podcast-meta">'+ds+' · '+sz+'</div></div>';
-        html+='<div class="podcast-actions"><button class="add-queue-btn" data-path="'+esc(p.path)+'" title="Add to queue">+</button></div>';
-        html+='</div>';
+
+    // Recently Played section
+    if(recentlyPlayed.length>0){
+      html+='<div class="section-header">⏱ Recently Played <span class="count">('+recentlyPlayed.length+')</span></div>';
+      recentlyPlayed.forEach(p=>{
+        html+=podcastCardHTML(p,{showFolder:true,resume:true});
       });
-      html+='</div>';
+    }
+
+    // Library section
+    if(!filtered.length&&podcasts.length){
+      html+='<div class="empty-state"><div class="empty-icon">🔍</div><div class="empty-text">No podcasts match "'+esc(searchTerm)+'"</div><div class="empty-sub">Try a different search term</div></div>';
+    }else if(!filtered.length){
+      html+='<div class="empty-state"><div class="empty-icon">🎙️</div><div class="empty-text">No podcasts found</div><div class="empty-sub">Generate podcasts from markdown files first</div></div>';
+    }else{
+      html+='<div class="section-header">📚 Library <span class="count">('+filtered.length+')</span></div>';
+      const groups={};
+      filtered.forEach(p=>{const f=p.folder||'Root';(groups[f]=groups[f]||[]).push(p);});
+      for(const[folder,items] of Object.entries(groups)){
+        html+='<div class="folder-group"><div class="folder-name">'+esc(folder)+'</div>';
+        items.forEach(p=>{html+=podcastCardHTML(p,{});});
+        html+='</div>';
+      }
     }
     lib.innerHTML=html;
-    lib.querySelectorAll('.podcast-item').forEach(el=>{
-      el.addEventListener('click', e=>{
-        if(e.target.closest('.add-queue-btn'))return;
+
+    // Bind events
+    lib.querySelectorAll('.podcast-card').forEach(el=>{
+      el.addEventListener('click',e=>{
+        if(e.target.closest('.add-queue-btn')||e.target.closest('.resume-btn'))return;
         playPodcast(el.dataset.path);
       });
     });
     lib.querySelectorAll('.add-queue-btn').forEach(btn=>{
-      btn.addEventListener('click', e=>{
+      btn.addEventListener('click',e=>{
         e.stopPropagation();
         const p=podcasts.find(x=>x.path===btn.dataset.path);
-        if(p&&!queue.find(q=>q.path===p.path)){ queue.push(p); saveQueue(); renderQueue(); btn.textContent='✓'; setTimeout(()=>btn.textContent='+',800); }
+        if(p&&!queue.find(q=>q.path===p.path)){queue.push(p);saveQueue();renderQueue();btn.textContent='✓';setTimeout(()=>btn.textContent='+',800);}
+      });
+    });
+    lib.querySelectorAll('.resume-btn').forEach(btn=>{
+      btn.addEventListener('click',e=>{
+        e.stopPropagation();
+        playPodcast(btn.dataset.path);
       });
     });
   }
 
   function renderQueue(){
     const qv=document.getElementById('queueView');
-    if(!queue.length){ qv.innerHTML='<div class="queue-empty">Queue is empty.<br>Tap + on a podcast to add it.</div>'; return; }
-    let html='';
+    if(!queue.length){
+      qv.innerHTML='<div class="empty-state"><div class="empty-icon">📋</div><div class="empty-text">Queue is empty</div><div class="empty-sub">Tap + on a podcast to add it</div></div>';
+      return;
+    }
+    let html='<div class="section-header">🎵 Up Next <span class="count">('+queue.length+')</span></div>';
     queue.forEach((p,i)=>{
+      const bg=artBg(p.folder);
       html+='<div class="queue-item" draggable="true" data-idx="'+i+'">';
       html+='<span class="drag-handle">☰</span>';
-      html+='<div class="podcast-icon">🎙️</div>';
+      html+='<div class="podcast-art" style="background:'+bg+';width:40px;height:40px;font-size:1.1em">🎙️</div>';
       html+='<div class="podcast-info" style="flex:1;min-width:0"><div class="podcast-name">'+esc(p.name)+'</div><div class="podcast-meta">'+esc(p.folder||'Root')+'</div></div>';
       html+='<button class="remove-btn" data-idx="'+i+'">✕</button>';
       html+='</div>';
     });
     qv.innerHTML=html;
+
     // Drag and drop
     let dragIdx=null;
     qv.querySelectorAll('.queue-item').forEach(el=>{
@@ -3082,12 +3359,38 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,san
         if(dragIdx!==null&&dragIdx!==toIdx){
           const item=queue.splice(dragIdx,1)[0];
           queue.splice(toIdx,0,item);
-          saveQueue(); renderQueue();
+          saveQueue();renderQueue();
         }
       });
+
+      // Touch swipe to remove
+      let startX=0,curX=0,swiping=false;
+      el.addEventListener('touchstart',e=>{
+        if(e.target.closest('.remove-btn')||e.target.closest('.drag-handle'))return;
+        startX=e.touches[0].clientX;swiping=true;el.classList.add('swiping');
+      },{passive:true});
+      el.addEventListener('touchmove',e=>{
+        if(!swiping)return;
+        curX=e.touches[0].clientX;
+        const dx=curX-startX;
+        if(dx<0) el.style.transform='translateX('+dx+'px)';
+      },{passive:true});
+      el.addEventListener('touchend',()=>{
+        if(!swiping)return;
+        swiping=false;el.classList.remove('swiping');
+        const dx=curX-startX;
+        if(dx<-100){
+          el.classList.add('removing');
+          setTimeout(()=>{queue.splice(+el.dataset.idx,1);saveQueue();renderQueue();},300);
+        }else{
+          el.style.transform='';
+        }
+        curX=0;
+      });
     });
+
     qv.querySelectorAll('.remove-btn').forEach(btn=>{
-      btn.addEventListener('click',()=>{ queue.splice(+btn.dataset.idx,1); saveQueue(); renderQueue(); });
+      btn.addEventListener('click',()=>{queue.splice(+btn.dataset.idx,1);saveQueue();renderQueue();});
     });
     // Tap to play
     qv.querySelectorAll('.queue-item').forEach(el=>{
@@ -3106,16 +3409,23 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,san
     audio.src='/api/media/'+encodeURIComponent(p.path).replace(/%2F/g,'/');
     const saved=progress[p.path];
     audio.addEventListener('loadedmetadata',function once(){
-      if(saved&&saved>0) audio.currentTime=saved;
+      if(saved&&saved.time>0) audio.currentTime=saved.time;
       audio.removeEventListener('loadedmetadata',once);
     });
+    // Mark as played immediately
+    if(!progress[p.path]) progress[p.path]={time:0,lastPlayed:Date.now(),duration:0};
+    else progress[p.path].lastPlayed=Date.now();
+
     audio.play();
+    audio.playbackRate=currentSpeed;
     playerBar.classList.add('visible');
     playerTitle.textContent=p.name;
     fsTitle.textContent=p.name;
     fsFolder.textContent=p.folder||'';
+    fsArtwork.style.background=artBg(p.folder);
     updatePlayBtn();
-    renderLibrary();
+    renderAll();
+    saveProgress();
   }
 
   function updatePlayBtn(){
@@ -3123,6 +3433,22 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,san
     btnPlay.textContent=icon;
     fsBtnPlay.textContent=icon;
   }
+
+  function applySpeed(){
+    audio.playbackRate=currentSpeed;
+    const label=currentSpeed===1?'1x':currentSpeed+'x';
+    btnSpeed.textContent=label;
+    fsBtnSpeed.textContent=label;
+  }
+  function cycleSpeed(){
+    const idx=SPEEDS.indexOf(currentSpeed);
+    currentSpeed=SPEEDS[(idx+1)%SPEEDS.length];
+    applySpeed();
+    progress._speed=currentSpeed;
+    saveProgress();
+  }
+  btnSpeed.onclick=cycleSpeed;
+  fsBtnSpeed.onclick=cycleSpeed;
 
   btnPlay.onclick=()=>{audio.paused?audio.play():audio.pause();};
   fsBtnPlay.onclick=()=>{audio.paused?audio.play():audio.pause();};
@@ -3145,14 +3471,15 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,san
 
   // Save progress every 5s
   setInterval(saveProgress, 5000);
-  audio.addEventListener('pause', saveProgress);
+  audio.addEventListener('pause', ()=>{saveProgressNow();renderLibrary();});
 
   // Auto-play next in queue
   audio.addEventListener('ended',()=>{
-    saveProgress();
+    saveProgressNow();
     if(!currentPodcast)return;
     const qi=queue.findIndex(q=>q.path===currentPodcast.path);
-    if(qi>=0&&qi<queue.length-1){ playPodcast(queue[qi+1].path); }
+    if(qi>=0&&qi<queue.length-1){playPodcast(queue[qi+1].path);}
+    else{renderLibrary();}
   });
 
   // Seek
@@ -3187,10 +3514,20 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,san
     });
   });
 
-  function esc(s){ const d=document.createElement('div'); d.textContent=s; return d.innerHTML; }
+  // Search
+  searchInput.addEventListener('input',()=>{
+    searchTerm=searchInput.value.trim();
+    searchClear.classList.toggle('visible',searchTerm.length>0);
+    renderLibrary();
+  });
+  searchClear.addEventListener('click',()=>{
+    searchInput.value='';searchTerm='';searchClear.classList.remove('visible');renderLibrary();searchInput.focus();
+  });
 
-  loadProgress().then(loadPodcasts);
-  renderQueue();
+  function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML;}
+
+  // Init
+  Promise.all([loadProgress(),loadQueue()]).then(()=>loadPodcasts());
 })();
 </script>
 </body>
