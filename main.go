@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"io"
 )
 
 const mdviewerFile = ".mdviewer"
@@ -195,6 +196,9 @@ func main() {
 	mux.HandleFunc("/api/save", a.handleSave)
 	mux.HandleFunc("/api/media/", a.handleMedia)
 	mux.HandleFunc("/api/podcast", a.handlePodcast)
+	mux.HandleFunc("/podcasts", a.handlePodcasts)
+	mux.HandleFunc("/api/podcasts", a.handlePodcastList)
+	mux.HandleFunc("/api/podcasts/progress", a.handlePodcastProgress)
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
@@ -955,6 +959,104 @@ func sanitizeRelativePath(path string) (string, error) {
 		return "", errors.New("invalid path")
 	}
 	return filepath.ToSlash(clean), nil
+}
+
+// --- Podcast Player ---
+
+type podcastEntry struct {
+	Name       string  `json:"name"`
+	Folder     string  `json:"folder"`
+	Path       string  `json:"path"`
+	Size       int64   `json:"size"`
+	ModifiedAt int64   `json:"modifiedAt"`
+	Duration   float64 `json:"duration,omitempty"`
+}
+
+func podcastProgressFile() string {
+	home, _ := os.UserHomeDir()
+	dir := filepath.Join(home, ".mdviewer")
+	os.MkdirAll(dir, 0755)
+	return filepath.Join(dir, "podcast-progress.json")
+}
+
+func (a *app) handlePodcasts(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprint(w, podcastsHTML)
+}
+
+func (a *app) handlePodcastList(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var podcasts []podcastEntry
+	filepath.WalkDir(a.root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() || !strings.HasSuffix(path, ".podcast.mp3") {
+			return nil
+		}
+		rel, _ := filepath.Rel(a.root, path)
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		name := filepath.Base(rel)
+		name = strings.TrimSuffix(name, ".podcast.mp3")
+		folder := filepath.Dir(rel)
+		if folder == "." {
+			folder = ""
+		}
+		podcasts = append(podcasts, podcastEntry{
+			Name:       name,
+			Folder:     folder,
+			Path:       filepath.ToSlash(rel),
+			Size:       info.Size(),
+			ModifiedAt: info.ModTime().Unix(),
+		})
+		return nil
+	})
+	if podcasts == nil {
+		podcasts = []podcastEntry{}
+	}
+	sort.Slice(podcasts, func(i, j int) bool {
+		return podcasts[i].ModifiedAt > podcasts[j].ModifiedAt
+	})
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(podcasts)
+}
+
+func (a *app) handlePodcastProgress(w http.ResponseWriter, r *http.Request) {
+	fp := podcastProgressFile()
+	switch r.Method {
+	case http.MethodGet:
+		data, err := os.ReadFile(fp)
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, "{}")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(data)
+	case http.MethodPost:
+		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		if err != nil {
+			http.Error(w, "read error", 400)
+			return
+		}
+		// Validate JSON
+		var check map[string]interface{}
+		if json.Unmarshal(body, &check) != nil {
+			http.Error(w, "invalid json", 400)
+			return
+		}
+		os.WriteFile(fp, body, 0644)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"ok":true}`)
+	default:
+		http.Error(w, "method not allowed", 405)
+	}
 }
 
 func secureJoin(root, rel string) (string, error) {
@@ -2744,6 +2846,353 @@ const indexHTML = `<!DOCTYPE html>
     });
 
   </script>
+</body>
+</html>
+`
+
+const podcastsHTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no"/>
+<title>Podcasts – Markdown Viewer</title>
+<style>
+:root{--bg:#0d1117;--panel:#161b22;--border:#30363d;--text:#c9d1d9;--muted:#8b949e;--link:#58a6ff;--active:#1f6feb33;--sidebar-bg:#010409;--button-bg:#21262d;--button-hover:#30363d}
+@media(prefers-color-scheme:light){:root{--bg:#f6f8fa;--panel:#ffffff;--border:#d0d7de;--text:#1f2328;--muted:#656d76;--link:#0969da;--active:#0969da1a;--sidebar-bg:#f0f0f0;--button-bg:#e8e8e8;--button-hover:#d0d7de}}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;padding-bottom:160px}
+.header{padding:16px;display:flex;align-items:center;gap:12px;border-bottom:1px solid var(--border);background:var(--panel);position:sticky;top:0;z-index:10}
+.header h1{font-size:1.2em;flex:1}
+.header a{color:var(--link);text-decoration:none;font-size:0.9em}
+.tabs{display:flex;border-bottom:1px solid var(--border);background:var(--panel);position:sticky;top:53px;z-index:9}
+.tab{flex:1;padding:12px;text-align:center;cursor:pointer;color:var(--muted);font-size:0.9em;border-bottom:2px solid transparent}
+.tab.active{color:var(--link);border-bottom-color:var(--link)}
+.library,.queue-view{padding:8px}
+.folder-group{margin-bottom:16px}
+.folder-name{font-size:0.8em;color:var(--muted);padding:8px 12px;text-transform:uppercase;letter-spacing:0.5px}
+.podcast-item{display:flex;align-items:center;padding:12px;border-radius:8px;cursor:pointer;gap:12px;min-height:56px}
+.podcast-item:active,.podcast-item:hover{background:var(--active)}
+.podcast-item.playing{background:var(--active)}
+.podcast-icon{width:40px;height:40px;border-radius:8px;background:var(--button-bg);display:flex;align-items:center;justify-content:center;font-size:1.2em;flex-shrink:0}
+.podcast-info{flex:1;min-width:0}
+.podcast-name{font-size:0.95em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.podcast-meta{font-size:0.75em;color:var(--muted);margin-top:2px}
+.podcast-actions{display:flex;gap:4px}
+.add-queue-btn{width:36px;height:36px;border:none;background:var(--button-bg);color:var(--text);border-radius:50%;cursor:pointer;font-size:1em;display:flex;align-items:center;justify-content:center}
+.add-queue-btn:hover{background:var(--button-hover)}
+/* Queue */
+.queue-item{display:flex;align-items:center;padding:12px;border-radius:8px;gap:12px;min-height:56px;cursor:grab}
+.queue-item.dragging{opacity:0.4}
+.queue-item .drag-handle{color:var(--muted);cursor:grab;font-size:1.2em}
+.queue-item .remove-btn{width:32px;height:32px;border:none;background:none;color:var(--muted);cursor:pointer;font-size:1em}
+.queue-empty{text-align:center;padding:48px 16px;color:var(--muted)}
+/* Player bar */
+.player-bar{position:fixed;bottom:0;left:0;right:0;background:var(--panel);border-top:1px solid var(--border);z-index:20;display:none;flex-direction:column}
+.player-bar.visible{display:flex}
+.progress-container{width:100%;height:4px;background:var(--border);cursor:pointer;position:relative}
+.progress-container:hover{height:8px}
+.progress-fill{height:100%;background:var(--link);pointer-events:none;width:0%}
+.player-main{display:flex;align-items:center;padding:8px 12px;gap:8px}
+.player-info{flex:1;min-width:0}
+.player-title{font-size:0.85em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.player-time{font-size:0.7em;color:var(--muted)}
+.player-controls{display:flex;align-items:center;gap:4px}
+.player-btn{width:48px;height:48px;border:none;background:none;color:var(--text);cursor:pointer;font-size:1.3em;border-radius:50%;display:flex;align-items:center;justify-content:center}
+.player-btn:hover{background:var(--button-hover)}
+.player-btn.play-btn{font-size:1.6em}
+/* Fullscreen player */
+.fullscreen-player{position:fixed;inset:0;background:var(--bg);z-index:30;display:none;flex-direction:column;padding:24px}
+.fullscreen-player.visible{display:flex}
+.fs-close{align-self:flex-start;background:none;border:none;color:var(--text);font-size:1.5em;cursor:pointer;padding:8px}
+.fs-artwork{flex:1;display:flex;align-items:center;justify-content:center}
+.fs-artwork .icon{width:200px;height:200px;border-radius:24px;background:var(--panel);display:flex;align-items:center;justify-content:center;font-size:5em}
+.fs-info{text-align:center;padding:24px 0}
+.fs-title{font-size:1.3em;font-weight:600}
+.fs-folder{font-size:0.9em;color:var(--muted);margin-top:4px}
+.fs-progress{padding:0 8px}
+.fs-progress-bar{width:100%;height:6px;background:var(--border);border-radius:3px;cursor:pointer;position:relative}
+.fs-progress-fill{height:100%;background:var(--link);border-radius:3px;pointer-events:none;width:0%}
+.fs-times{display:flex;justify-content:space-between;font-size:0.75em;color:var(--muted);margin-top:6px}
+.fs-controls{display:flex;justify-content:center;align-items:center;gap:16px;padding:24px 0}
+.fs-btn{width:56px;height:56px;border:none;background:none;color:var(--text);cursor:pointer;font-size:1.5em;border-radius:50%;display:flex;align-items:center;justify-content:center}
+.fs-btn:hover{background:var(--button-hover)}
+.fs-btn.play{width:72px;height:72px;font-size:2em;background:var(--link);color:#fff;border-radius:50%}
+.loading{text-align:center;padding:48px;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>🎧 Podcasts</h1>
+  <a href="/">← Back</a>
+</div>
+<div class="tabs">
+  <div class="tab active" data-tab="library">Library</div>
+  <div class="tab" data-tab="queue">Queue</div>
+</div>
+<div class="library" id="library"><div class="loading">Loading podcasts…</div></div>
+<div class="queue-view" id="queueView" style="display:none"></div>
+
+<!-- Mini player bar -->
+<div class="player-bar" id="playerBar">
+  <div class="progress-container" id="progressBar"><div class="progress-fill" id="progressFill"></div></div>
+  <div class="player-main">
+    <div class="player-info" id="playerInfoClick">
+      <div class="player-title" id="playerTitle">—</div>
+      <div class="player-time"><span id="playerCur">0:00</span> / <span id="playerDur">0:00</span></div>
+    </div>
+    <div class="player-controls">
+      <button class="player-btn" id="btnRew">⏪</button>
+      <button class="player-btn play-btn" id="btnPlay">▶️</button>
+      <button class="player-btn" id="btnFwd">⏩</button>
+    </div>
+  </div>
+</div>
+
+<!-- Fullscreen player -->
+<div class="fullscreen-player" id="fsPlayer">
+  <button class="fs-close" id="fsClose">✕</button>
+  <div class="fs-artwork"><div class="icon">🎙️</div></div>
+  <div class="fs-info">
+    <div class="fs-title" id="fsTitle">—</div>
+    <div class="fs-folder" id="fsFolder"></div>
+  </div>
+  <div class="fs-progress">
+    <div class="fs-progress-bar" id="fsProgressBar"><div class="fs-progress-fill" id="fsProgressFill"></div></div>
+    <div class="fs-times"><span id="fsCur">0:00</span><span id="fsDur">0:00</span></div>
+  </div>
+  <div class="fs-controls">
+    <button class="fs-btn" id="fsBtnRew">⏪</button>
+    <button class="fs-btn play" id="fsBtnPlay">▶️</button>
+    <button class="fs-btn" id="fsBtnFwd">⏩</button>
+  </div>
+</div>
+
+<audio id="audio" preload="metadata"></audio>
+
+<script>
+(function(){
+  const audio = document.getElementById('audio');
+  const playerBar = document.getElementById('playerBar');
+  const playerTitle = document.getElementById('playerTitle');
+  const playerCur = document.getElementById('playerCur');
+  const playerDur = document.getElementById('playerDur');
+  const progressFill = document.getElementById('progressFill');
+  const progressBar = document.getElementById('progressBar');
+  const btnPlay = document.getElementById('btnPlay');
+  const btnRew = document.getElementById('btnRew');
+  const btnFwd = document.getElementById('btnFwd');
+  const fsPlayer = document.getElementById('fsPlayer');
+  const fsTitle = document.getElementById('fsTitle');
+  const fsFolder = document.getElementById('fsFolder');
+  const fsCur = document.getElementById('fsCur');
+  const fsDur = document.getElementById('fsDur');
+  const fsProgressFill = document.getElementById('fsProgressFill');
+  const fsProgressBar = document.getElementById('fsProgressBar');
+  const fsBtnPlay = document.getElementById('fsBtnPlay');
+
+  let podcasts = [];
+  let currentPodcast = null;
+  let progress = {};
+  let queue = JSON.parse(localStorage.getItem('podcast-queue') || '[]');
+
+  function fmt(s){
+    if(!s||isNaN(s))return '0:00';
+    s=Math.floor(s);
+    const m=Math.floor(s/60), sec=s%60;
+    return m+':'+(sec<10?'0':'')+sec;
+  }
+
+  function saveQueue(){ localStorage.setItem('podcast-queue', JSON.stringify(queue)); }
+
+  async function loadProgress(){
+    try{ const r=await fetch('/api/podcasts/progress'); progress=await r.json(); }catch(e){ progress={}; }
+  }
+
+  async function saveProgress(){
+    if(!currentPodcast||!audio.currentTime)return;
+    progress[currentPodcast.path]=audio.currentTime;
+    try{ await fetch('/api/podcasts/progress',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(progress)}); }catch(e){}
+  }
+
+  async function loadPodcasts(){
+    const r=await fetch('/api/podcasts');
+    podcasts=await r.json();
+    renderLibrary();
+  }
+
+  function renderLibrary(){
+    const lib=document.getElementById('library');
+    if(!podcasts.length){ lib.innerHTML='<div class="queue-empty">No podcasts found.<br>Generate podcasts from markdown files first.</div>'; return; }
+    const groups={};
+    podcasts.forEach(p=>{ const f=p.folder||'Root'; (groups[f]=groups[f]||[]).push(p); });
+    let html='';
+    for(const[folder,items] of Object.entries(groups)){
+      html+='<div class="folder-group"><div class="folder-name">'+esc(folder)+'</div>';
+      items.forEach(p=>{
+        const d=new Date(p.modifiedAt*1000);
+        const ds=d.toLocaleDateString(undefined,{month:'short',day:'numeric',year:'numeric'});
+        const sz=(p.size/(1024*1024)).toFixed(1)+'MB';
+        const playing=currentPodcast&&currentPodcast.path===p.path;
+        html+='<div class="podcast-item'+(playing?' playing':'')+'" data-path="'+esc(p.path)+'">';
+        html+='<div class="podcast-icon">'+(playing?'🔊':'🎙️')+'</div>';
+        html+='<div class="podcast-info"><div class="podcast-name">'+esc(p.name)+'</div><div class="podcast-meta">'+ds+' · '+sz+'</div></div>';
+        html+='<div class="podcast-actions"><button class="add-queue-btn" data-path="'+esc(p.path)+'" title="Add to queue">+</button></div>';
+        html+='</div>';
+      });
+      html+='</div>';
+    }
+    lib.innerHTML=html;
+    lib.querySelectorAll('.podcast-item').forEach(el=>{
+      el.addEventListener('click', e=>{
+        if(e.target.closest('.add-queue-btn'))return;
+        playPodcast(el.dataset.path);
+      });
+    });
+    lib.querySelectorAll('.add-queue-btn').forEach(btn=>{
+      btn.addEventListener('click', e=>{
+        e.stopPropagation();
+        const p=podcasts.find(x=>x.path===btn.dataset.path);
+        if(p&&!queue.find(q=>q.path===p.path)){ queue.push(p); saveQueue(); renderQueue(); btn.textContent='✓'; setTimeout(()=>btn.textContent='+',800); }
+      });
+    });
+  }
+
+  function renderQueue(){
+    const qv=document.getElementById('queueView');
+    if(!queue.length){ qv.innerHTML='<div class="queue-empty">Queue is empty.<br>Tap + on a podcast to add it.</div>'; return; }
+    let html='';
+    queue.forEach((p,i)=>{
+      html+='<div class="queue-item" draggable="true" data-idx="'+i+'">';
+      html+='<span class="drag-handle">☰</span>';
+      html+='<div class="podcast-icon">🎙️</div>';
+      html+='<div class="podcast-info" style="flex:1;min-width:0"><div class="podcast-name">'+esc(p.name)+'</div><div class="podcast-meta">'+esc(p.folder||'Root')+'</div></div>';
+      html+='<button class="remove-btn" data-idx="'+i+'">✕</button>';
+      html+='</div>';
+    });
+    qv.innerHTML=html;
+    // Drag and drop
+    let dragIdx=null;
+    qv.querySelectorAll('.queue-item').forEach(el=>{
+      el.addEventListener('dragstart',e=>{dragIdx=+el.dataset.idx;el.classList.add('dragging');});
+      el.addEventListener('dragend',()=>{el.classList.remove('dragging');});
+      el.addEventListener('dragover',e=>{e.preventDefault();});
+      el.addEventListener('drop',e=>{
+        e.preventDefault();
+        const toIdx=+el.dataset.idx;
+        if(dragIdx!==null&&dragIdx!==toIdx){
+          const item=queue.splice(dragIdx,1)[0];
+          queue.splice(toIdx,0,item);
+          saveQueue(); renderQueue();
+        }
+      });
+    });
+    qv.querySelectorAll('.remove-btn').forEach(btn=>{
+      btn.addEventListener('click',()=>{ queue.splice(+btn.dataset.idx,1); saveQueue(); renderQueue(); });
+    });
+    // Tap to play
+    qv.querySelectorAll('.queue-item').forEach(el=>{
+      el.addEventListener('click',e=>{
+        if(e.target.closest('.remove-btn')||e.target.closest('.drag-handle'))return;
+        const p=queue[+el.dataset.idx];
+        if(p) playPodcast(p.path);
+      });
+    });
+  }
+
+  function playPodcast(path){
+    const p=podcasts.find(x=>x.path===path);
+    if(!p)return;
+    currentPodcast=p;
+    audio.src='/api/media/'+encodeURIComponent(p.path).replace(/%2F/g,'/');
+    const saved=progress[p.path];
+    audio.addEventListener('loadedmetadata',function once(){
+      if(saved&&saved>0) audio.currentTime=saved;
+      audio.removeEventListener('loadedmetadata',once);
+    });
+    audio.play();
+    playerBar.classList.add('visible');
+    playerTitle.textContent=p.name;
+    fsTitle.textContent=p.name;
+    fsFolder.textContent=p.folder||'';
+    updatePlayBtn();
+    renderLibrary();
+  }
+
+  function updatePlayBtn(){
+    const icon=audio.paused?'▶️':'⏸️';
+    btnPlay.textContent=icon;
+    fsBtnPlay.textContent=icon;
+  }
+
+  btnPlay.onclick=()=>{audio.paused?audio.play():audio.pause();};
+  fsBtnPlay.onclick=()=>{audio.paused?audio.play():audio.pause();};
+  btnRew.onclick=()=>{audio.currentTime=Math.max(0,audio.currentTime-15);};
+  btnFwd.onclick=()=>{audio.currentTime=Math.min(audio.duration||0,audio.currentTime+15);};
+  document.getElementById('fsBtnRew').onclick=btnRew.onclick;
+  document.getElementById('fsBtnFwd').onclick=btnFwd.onclick;
+
+  audio.addEventListener('play', updatePlayBtn);
+  audio.addEventListener('pause', updatePlayBtn);
+  audio.addEventListener('timeupdate',()=>{
+    const pct=audio.duration?(audio.currentTime/audio.duration*100):0;
+    progressFill.style.width=pct+'%';
+    fsProgressFill.style.width=pct+'%';
+    playerCur.textContent=fmt(audio.currentTime);
+    playerDur.textContent=fmt(audio.duration);
+    fsCur.textContent=fmt(audio.currentTime);
+    fsDur.textContent=fmt(audio.duration);
+  });
+
+  // Save progress every 5s
+  setInterval(saveProgress, 5000);
+  audio.addEventListener('pause', saveProgress);
+
+  // Auto-play next in queue
+  audio.addEventListener('ended',()=>{
+    saveProgress();
+    if(!currentPodcast)return;
+    const qi=queue.findIndex(q=>q.path===currentPodcast.path);
+    if(qi>=0&&qi<queue.length-1){ playPodcast(queue[qi+1].path); }
+  });
+
+  // Seek
+  function seek(bar,fill,e){
+    const rect=bar.getBoundingClientRect();
+    const pct=Math.max(0,Math.min(1,(e.clientX-rect.left)/rect.width));
+    if(audio.duration) audio.currentTime=pct*audio.duration;
+  }
+  [progressBar,fsProgressBar].forEach(bar=>{
+    const fill=bar===progressBar?progressFill:fsProgressFill;
+    let dragging=false;
+    bar.addEventListener('mousedown',e=>{dragging=true;seek(bar,fill,e);});
+    bar.addEventListener('touchstart',e=>{dragging=true;seek(bar,fill,e.touches[0]);},{passive:true});
+    document.addEventListener('mousemove',e=>{if(dragging)seek(bar,fill,e);});
+    document.addEventListener('touchmove',e=>{if(dragging)seek(bar,fill,e.touches[0]);},{passive:true});
+    document.addEventListener('mouseup',()=>{dragging=false;});
+    document.addEventListener('touchend',()=>{dragging=false;});
+  });
+
+  // Fullscreen player
+  document.getElementById('playerInfoClick').addEventListener('click',()=>fsPlayer.classList.add('visible'));
+  document.getElementById('fsClose').addEventListener('click',()=>fsPlayer.classList.remove('visible'));
+
+  // Tabs
+  document.querySelectorAll('.tab').forEach(t=>{
+    t.addEventListener('click',()=>{
+      document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
+      t.classList.add('active');
+      document.getElementById('library').style.display=t.dataset.tab==='library'?'':'none';
+      document.getElementById('queueView').style.display=t.dataset.tab==='queue'?'':'none';
+      if(t.dataset.tab==='queue') renderQueue();
+    });
+  });
+
+  function esc(s){ const d=document.createElement('div'); d.textContent=s; return d.innerHTML; }
+
+  loadProgress().then(loadPodcasts);
+  renderQueue();
+})();
+</script>
 </body>
 </html>
 `
