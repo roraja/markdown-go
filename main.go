@@ -207,11 +207,21 @@ func main() {
 	})
 
 	if *podcastWatchFlag != "" {
-		dirs := strings.Split(*podcastWatchFlag, ",")
-		for i := range dirs {
-			dirs[i] = strings.TrimSpace(dirs[i])
+		entries := strings.Split(*podcastWatchFlag, ",")
+		var dirs []string
+		var patterns []string
+		for _, e := range entries {
+			e = strings.TrimSpace(e)
+			if e == "" {
+				continue
+			}
+			if strings.ContainsAny(e, "*?") {
+				patterns = append(patterns, e)
+			} else {
+				dirs = append(dirs, e)
+			}
 		}
-		go a.startPodcastWatcher(dirs)
+		go a.startPodcastWatcher(dirs, patterns)
 	}
 
 	addr := ":" + *portFlag
@@ -758,7 +768,7 @@ func (a *app) generatePodcast(relPath string, job *podcastJob) {
 
 // --- Podcast Auto-Watch ---
 
-func (a *app) startPodcastWatcher(dirs []string) {
+func (a *app) startPodcastWatcher(dirs []string, patterns []string) {
 	stateFile := filepath.Join(os.Getenv("HOME"), ".mdviewer", "podcast-watch-state.json")
 	os.MkdirAll(filepath.Dir(stateFile), 0755)
 
@@ -775,7 +785,7 @@ func (a *app) startPodcastWatcher(dirs []string) {
 		os.WriteFile(stateFile, data, 0644)
 	}
 
-	log.Printf("[podcast-watch] Starting auto-podcast watcher for directories: %v", dirs)
+	log.Printf("[podcast-watch] Starting auto-podcast watcher for directories: %v, patterns: %v", dirs, patterns)
 
 	// Queue for serial generation
 	queue := make(chan string, 1000)
@@ -808,73 +818,107 @@ func (a *app) startPodcastWatcher(dirs []string) {
 	defer ticker.Stop()
 
 	scan := func() {
+		processed := make(map[string]bool)
+
+		// Process files in a given path with the needsGen logic
+		processFile := func(path string, d fs.DirEntry) {
+			if d.IsDir() {
+				return
+			}
+			if !strings.HasSuffix(path, ".md") {
+				return
+			}
+			base := filepath.Base(path)
+			if strings.HasPrefix(base, ".") || strings.HasSuffix(path, ".podcast-script.txt") {
+				return
+			}
+
+			relPath, err := filepath.Rel(a.root, path)
+			if err != nil {
+				return
+			}
+			relPath = filepath.ToSlash(relPath)
+
+			if processed[relPath] {
+				return
+			}
+			processed[relPath] = true
+
+			info, err := d.Info()
+			if err != nil {
+				return
+			}
+			modTime := info.ModTime().Unix()
+
+			mp3Path := a.podcastMP3Path(relPath)
+			mp3Info, mp3Err := os.Stat(mp3Path)
+
+			needsGen := false
+			if mp3Err != nil {
+				if _, seen := known[relPath]; !seen {
+					needsGen = true
+					log.Printf("[podcast-watch] New file detected: %s", relPath)
+				}
+			} else {
+				if modTime > mp3Info.ModTime().Unix() {
+					needsGen = true
+					log.Printf("[podcast-watch] File modified since last podcast: %s", relPath)
+				}
+			}
+
+			known[relPath] = modTime
+
+			if needsGen {
+				a.podcastMu.Lock()
+				existing, exists := a.podcastJobs[relPath]
+				busy := exists && existing.Status == "generating"
+				a.podcastMu.Unlock()
+
+				if !busy {
+					log.Printf("[podcast-watch] Queuing podcast generation for: %s", relPath)
+					select {
+					case queue <- relPath:
+					default:
+						log.Printf("[podcast-watch] Queue full, skipping: %s", relPath)
+					}
+				}
+			}
+		}
+
+		// Scan watched directories
 		for _, dir := range dirs {
 			absDir := filepath.Join(a.root, dir)
 			filepath.WalkDir(absDir, func(path string, d fs.DirEntry, err error) error {
+				if err != nil {
+					return nil
+				}
+				processFile(path, d)
+				return nil
+			})
+		}
+
+		// Scan for glob pattern matches across entire root
+		if len(patterns) > 0 {
+			filepath.WalkDir(a.root, func(path string, d fs.DirEntry, err error) error {
 				if err != nil || d.IsDir() {
 					return nil
 				}
 				if !strings.HasSuffix(path, ".md") {
 					return nil
 				}
-				// Skip hidden files and podcast scripts
 				base := filepath.Base(path)
-				if strings.HasPrefix(base, ".") || strings.HasSuffix(path, ".podcast-script.txt") {
-					return nil
-				}
-
-				relPath, err := filepath.Rel(a.root, path)
-				if err != nil {
-					return nil
-				}
-				relPath = filepath.ToSlash(relPath)
-
-				info, err := d.Info()
-				if err != nil {
-					return nil
-				}
-				modTime := info.ModTime().Unix()
-
-				mp3Path := a.podcastMP3Path(relPath)
-				mp3Info, mp3Err := os.Stat(mp3Path)
-
-				needsGen := false
-				if mp3Err != nil {
-					// No mp3 exists
-					if _, seen := known[relPath]; !seen {
-						needsGen = true
-						log.Printf("[podcast-watch] New file detected: %s", relPath)
-					}
-				} else {
-					// mp3 exists but md is newer
-					if modTime > mp3Info.ModTime().Unix() {
-						needsGen = true
-						log.Printf("[podcast-watch] File modified since last podcast: %s", relPath)
+				for _, pat := range patterns {
+					matched, matchErr := filepath.Match(pat, base)
+					if matchErr == nil && matched {
+						log.Printf("[podcast-watch] Pattern %q matched: %s", pat, path)
+						processFile(path, d)
+						break
 					}
 				}
-
-				known[relPath] = modTime
-
-				if needsGen {
-					// Don't queue if already generating
-					a.podcastMu.Lock()
-					existing, exists := a.podcastJobs[relPath]
-					busy := exists && existing.Status == "generating"
-					a.podcastMu.Unlock()
-
-					if !busy {
-						log.Printf("[podcast-watch] Queuing podcast generation for: %s", relPath)
-						select {
-						case queue <- relPath:
-						default:
-							log.Printf("[podcast-watch] Queue full, skipping: %s", relPath)
-						}
-					}
-				}
-
 				return nil
 			})
 		}
+
 		saveState()
 	}
 
