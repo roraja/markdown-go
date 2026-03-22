@@ -96,6 +96,35 @@ The sidebar **live-updates** every 5 seconds — new files, deletions, and modif
 
 - `-root` (default `.`): Root directory scanned recursively for Markdown files.
 - `-port` (default `8080`): HTTP port to listen on.
+- `-podcast-watch` (optional): Comma-separated list of directories and/or glob patterns to watch for auto podcast generation.
+
+### Auto Podcast Generation (`-podcast-watch`)
+
+Automatically generates podcasts for new or updated markdown files in watched locations.
+
+```bash
+# Watch specific directories
+mdviewer -root ./docs -podcast-watch "guides,blog/posts"
+
+# Watch filename patterns (matches across ALL directories)
+mdviewer -root ./workspace -podcast-watch "*-review.md,*-concepts.md"
+
+# Mix directories and patterns
+mdviewer -root ./workspace -podcast-watch "journal,01-projects/pi-router,*code-review*.md,*-concepts.md"
+```
+
+**How it works:**
+- Scans every 30 seconds for `.md` files in watched directories
+- Glob patterns (`*`, `?`) match against filenames in any directory under root
+- Auto-triggers podcast generation when:
+  - A new `.md` file appears without a `.podcast.mp3` sibling
+  - An existing `.md` file is newer than its `.podcast.mp3` (re-generates)
+- One podcast generates at a time (queued) to avoid CPU overload
+- State tracked in `~/.mdviewer/podcast-watch-state.json`
+
+**Pattern rules:**
+- Entry containing `*` or `?` → treated as a glob pattern (matched against filename only)
+- Entry without wildcards → treated as a directory path (relative to `-root`)
 
 ## Optional direct file link
 
