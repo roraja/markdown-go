@@ -26,16 +26,26 @@ var embeddedPodcastScript []byte
 
 const mdviewerFile = ".mdviewer"
 
-// ensureEmbeddedPodcastScript extracts the embedded podcast_gen.py to
-// ~/.mdviewer/podcast_gen.py so the binary is self-contained. Returns
-// the path to the extracted script.
-func ensureEmbeddedPodcastScript() string {
+// mdviewerDataDir returns the path to the mdviewer data directory
+// (~/.local/mdviewer), creating it if it doesn't exist.
+func mdviewerDataDir() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return ""
 	}
-	dir := filepath.Join(home, ".mdviewer")
+	dir := filepath.Join(home, ".local", "mdviewer")
 	os.MkdirAll(dir, 0755)
+	return dir
+}
+
+// ensureEmbeddedPodcastScript extracts the embedded podcast_gen.py to
+// ~/.local/mdviewer/podcast_gen.py so the binary is self-contained. Returns
+// the path to the extracted script.
+func ensureEmbeddedPodcastScript() string {
+	dir := mdviewerDataDir()
+	if dir == "" {
+		return ""
+	}
 	dest := filepath.Join(dir, "podcast_gen.py")
 
 	// Always overwrite — the embedded version matches this binary's release.
@@ -210,7 +220,7 @@ func main() {
 
 	a := &app{root: absRoot, tpl: tpl, podcastJobs: make(map[string]*podcastJob)}
 
-	// Extract embedded podcast_gen.py to ~/.mdviewer/ so it's always available
+	// Extract embedded podcast_gen.py to ~/.local/mdviewer/ so it's always available
 	if p := ensureEmbeddedPodcastScript(); p != "" {
 		log.Printf("Extracted podcast_gen.py to %s", p)
 	}
@@ -683,7 +693,7 @@ func (a *app) generatePodcast(relPath string, job *podcastJob) {
 	mp3Path := a.podcastMP3Path(relPath)
 
 	// Ensure log directory exists
-	logDir := filepath.Join(os.Getenv("HOME"), ".mdviewer", "logs")
+	logDir := filepath.Join(mdviewerDataDir(), "logs")
 	os.MkdirAll(logDir, 0755)
 	logFile := filepath.Join(logDir, "podcast.log")
 
@@ -701,7 +711,7 @@ func (a *app) generatePodcast(relPath string, job *podcastJob) {
 	// then check next to the binary, standard install path, and dev source.
 	home, _ := os.UserHomeDir()
 	scriptLocations := []string{
-		filepath.Join(home, ".mdviewer", "podcast_gen.py"),
+		filepath.Join(mdviewerDataDir(), "podcast_gen.py"),
 		filepath.Join(filepath.Dir(os.Args[0]), "podcast_gen.py"),
 		"/usr/local/share/mdviewer/podcast_gen.py",
 		filepath.Join(home, "src", "markdown-go", "podcast_gen.py"),
@@ -802,7 +812,7 @@ func (a *app) generatePodcast(relPath string, job *podcastJob) {
 // --- Podcast Auto-Watch ---
 
 func (a *app) startPodcastWatcher(dirs []string, patterns []string) {
-	stateFile := filepath.Join(os.Getenv("HOME"), ".mdviewer", "podcast-watch-state.json")
+	stateFile := filepath.Join(mdviewerDataDir(), "podcast-watch-state.json")
 	os.MkdirAll(filepath.Dir(stateFile), 0755)
 
 	// State: map of relPath -> mod time (unix)
@@ -1188,10 +1198,7 @@ type podcastEntry struct {
 }
 
 func podcastProgressFile() string {
-	home, _ := os.UserHomeDir()
-	dir := filepath.Join(home, ".mdviewer")
-	os.MkdirAll(dir, 0755)
-	return filepath.Join(dir, "podcast-progress.json")
+	return filepath.Join(mdviewerDataDir(), "podcast-progress.json")
 }
 
 func (a *app) handlePodcasts(w http.ResponseWriter, r *http.Request) {
@@ -1275,10 +1282,7 @@ func (a *app) handlePodcastProgress(w http.ResponseWriter, r *http.Request) {
 }
 
 func podcastQueueFile() string {
-	home, _ := os.UserHomeDir()
-	dir := filepath.Join(home, ".mdviewer")
-	os.MkdirAll(dir, 0755)
-	return filepath.Join(dir, "podcast-queue.json")
+	return filepath.Join(mdviewerDataDir(), "podcast-queue.json")
 }
 
 func (a *app) handlePodcastQueue(w http.ResponseWriter, r *http.Request) {
