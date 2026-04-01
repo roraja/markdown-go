@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"bufio"
+	_ "embed"
 	"fmt"
 	"os"
 	"os/exec"
@@ -20,7 +21,30 @@ import (
 	"io"
 )
 
+//go:embed podcast_gen.py
+var embeddedPodcastScript []byte
+
 const mdviewerFile = ".mdviewer"
+
+// ensureEmbeddedPodcastScript extracts the embedded podcast_gen.py to
+// ~/.mdviewer/podcast_gen.py so the binary is self-contained. Returns
+// the path to the extracted script.
+func ensureEmbeddedPodcastScript() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	dir := filepath.Join(home, ".mdviewer")
+	os.MkdirAll(dir, 0755)
+	dest := filepath.Join(dir, "podcast_gen.py")
+
+	// Always overwrite — the embedded version matches this binary's release.
+	if err := os.WriteFile(dest, embeddedPodcastScript, 0755); err != nil {
+		log.Printf("Warning: failed to extract embedded podcast_gen.py: %v", err)
+		return ""
+	}
+	return dest
+}
 
 var validTags = map[string]bool{
 	"DONE":        true,
@@ -185,6 +209,12 @@ func main() {
 	}
 
 	a := &app{root: absRoot, tpl: tpl, podcastJobs: make(map[string]*podcastJob)}
+
+	// Extract embedded podcast_gen.py to ~/.mdviewer/ so it's always available
+	if p := ensureEmbeddedPodcastScript(); p != "" {
+		log.Printf("Extracted podcast_gen.py to %s", p)
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", a.handleIndex)
 	mux.HandleFunc("/api/files", a.handleFiles)
@@ -667,11 +697,14 @@ func (a *app) generatePodcast(relPath string, job *podcastJob) {
 
 	appendLog("Starting podcast generation")
 
-	// Find podcast_gen.py next to the binary, or in known locations
+	// Find podcast_gen.py — prefer the embedded copy extracted at startup,
+	// then check next to the binary, standard install path, and dev source.
+	home, _ := os.UserHomeDir()
 	scriptLocations := []string{
+		filepath.Join(home, ".mdviewer", "podcast_gen.py"),
 		filepath.Join(filepath.Dir(os.Args[0]), "podcast_gen.py"),
 		"/usr/local/share/mdviewer/podcast_gen.py",
-		filepath.Join(os.Getenv("HOME"), "src", "markdown-go", "podcast_gen.py"),
+		filepath.Join(home, "src", "markdown-go", "podcast_gen.py"),
 	}
 
 	var scriptPath string

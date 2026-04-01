@@ -95,7 +95,7 @@ def detect_provider(args) -> dict:
     api_url = args.api_url or os.environ.get("PODCAST_API_URL")
     api_token = args.api_token or os.environ.get("PODCAST_API_TOKEN") or os.environ.get("OPENCLAW_TOKEN")
     if api_url:
-        return {"type": "openai_compat", "url": api_url, "token": api_token, "model": args.model or "default"}
+        return {"type": "openai_compat", "url": api_url, "token": api_token, "model": args.model or os.environ.get("PODCAST_MODEL", "openclaw")}
 
     # 2. OpenAI
     if os.environ.get("OPENAI_API_KEY"):
