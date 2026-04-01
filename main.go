@@ -3052,6 +3052,13 @@ const indexHTML = `<!DOCTYPE html>
           podcastStatus.classList.remove('hidden');
           podcastPlayer.classList.add('hidden');
           startPodcastPoll(filePath);
+        } else if (data.status === 'error') {
+          podcastBtn.textContent = '🎙️ Podcast';
+          podcastBtn.disabled = false;
+          podcastPlayer.classList.add('hidden');
+          podcastStatus.classList.add('hidden');
+          stopPodcastPoll();
+          alert('Podcast generation failed:\n\n' + (data.error || 'Unknown error'));
         } else {
           podcastBtn.textContent = '🎙️ Podcast';
           podcastBtn.disabled = false;
