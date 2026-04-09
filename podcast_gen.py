@@ -11,9 +11,9 @@ Usage:
 LLM Provider (auto-detected in order):
     1. --api-url + --api-token (any OpenAI-compatible API)
     2. PODCAST_API_URL + PODCAST_API_TOKEN env vars
-    3. GitHub Copilot CLI: `gh copilot` with --model flag
-    4. OpenAI API: OPENAI_API_KEY env var
-    5. Anthropic API: ANTHROPIC_API_KEY env var
+    3. OpenAI API: OPENAI_API_KEY env var
+    4. Anthropic API: ANTHROPIC_API_KEY env var
+    5. GitHub Copilot CLI: `gh copilot -p` (requires `gh auth login`)
 
 Architecture:
     1. Read markdown → extract text
@@ -35,9 +35,8 @@ import tempfile
 import time
 from pathlib import Path
 
-import numpy as np
-import soundfile as sf
-from pydub import AudioSegment
+# Heavy audio deps are imported lazily in synthesize_audio() so that
+# --script-only works without numpy/pydub/soundfile/kokoro installed.
 
 KOKORO_MODEL = os.environ.get("KOKORO_MODEL", os.path.expanduser("~/.local/share/kokoro/kokoro-v1.0.onnx"))
 KOKORO_VOICES = os.environ.get("KOKORO_VOICES", os.path.expanduser("~/.local/share/kokoro/voices-v1.0.bin"))
@@ -91,27 +90,30 @@ def read_markdown(filepath: str) -> str:
 
 def detect_provider(args) -> dict:
     """Auto-detect LLM provider. Returns dict with 'type' and connection details."""
+    # Model can come from CLI flag, env var, or provider-specific default
+    model_override = args.model or os.environ.get("PODCAST_MODEL")
+
     # 1. Explicit API URL
     api_url = args.api_url or os.environ.get("PODCAST_API_URL")
     api_token = args.api_token or os.environ.get("PODCAST_API_TOKEN") or os.environ.get("OPENCLAW_TOKEN")
     if api_url:
-        return {"type": "openai_compat", "url": api_url, "token": api_token, "model": args.model or os.environ.get("PODCAST_MODEL", "openclaw")}
+        return {"type": "openai_compat", "url": api_url, "token": api_token, "model": model_override or "default"}
 
     # 2. OpenAI
     if os.environ.get("OPENAI_API_KEY"):
         return {"type": "openai_compat", "url": "https://api.openai.com/v1/chat/completions",
-                "token": os.environ["OPENAI_API_KEY"], "model": args.model or "gpt-4o"}
+                "token": os.environ["OPENAI_API_KEY"], "model": model_override or "gpt-4o"}
 
     # 3. Anthropic
     if os.environ.get("ANTHROPIC_API_KEY"):
         return {"type": "anthropic", "token": os.environ["ANTHROPIC_API_KEY"],
-                "model": args.model or "claude-sonnet-4-20250514"}
+                "model": model_override or "claude-sonnet-4-20250514"}
 
-    # 4. GitHub Copilot CLI
+    # 4. GitHub Copilot CLI (gh copilot -p)
     try:
         result = subprocess.run(["gh", "auth", "status"], capture_output=True, timeout=5)
         if result.returncode == 0:
-            return {"type": "gh_copilot", "model": args.model or "claude-3.5-sonnet"}
+            return {"type": "gh_copilot", "model": model_override or "gpt-4o"}
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
 
@@ -136,12 +138,19 @@ def call_llm(provider: dict, system_prompt: str, user_msg: str) -> str:
         if provider.get("token"):
             headers["Authorization"] = f"Bearer {provider['token']}"
 
+        print(f"[llm] POST {provider['url']} model={provider['model']}", flush=True)
         req = urllib.request.Request(
             provider["url"], data=json.dumps(payload).encode(),
             headers=headers, method="POST"
         )
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            result = json.loads(resp.read())
+        timeout = int(os.environ.get("PODCAST_LLM_TIMEOUT", "600"))
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                result = json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            print(f"[llm] HTTP {e.code}: {body}", flush=True)
+            raise
         return result["choices"][0]["message"]["content"]
 
     elif provider["type"] == "anthropic":
@@ -160,20 +169,34 @@ def call_llm(provider: dict, system_prompt: str, user_msg: str) -> str:
             "https://api.anthropic.com/v1/messages",
             data=json.dumps(payload).encode(), headers=headers, method="POST"
         )
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            result = json.loads(resp.read())
+        timeout = int(os.environ.get("PODCAST_LLM_TIMEOUT", "600"))
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                result = json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            print(f"[llm] HTTP {e.code}: {body}", flush=True)
+            raise
         return result["content"][0]["text"]
 
     elif provider["type"] == "gh_copilot":
-        # Use gh copilot via subprocess
+        # Use gh copilot CLI with -p flag for non-interactive prompting.
+        # Combines system prompt and user message into a single prompt.
         full_prompt = f"{system_prompt}\n\n---\n\n{user_msg}"
+        timeout = int(os.environ.get("PODCAST_LLM_TIMEOUT", "600"))
+        print(f"[llm] gh copilot -p (timeout={timeout}s)", flush=True)
         result = subprocess.run(
-            ["gh", "copilot", "suggest", "-t", "shell", full_prompt],
-            capture_output=True, text=True, timeout=120
+            ["gh", "copilot", "-p", full_prompt],
+            capture_output=True, text=True, timeout=timeout
         )
         if result.returncode != 0:
-            raise RuntimeError(f"gh copilot failed: {result.stderr}")
-        return result.stdout
+            raise RuntimeError(f"gh copilot failed (exit {result.returncode}): {result.stderr}")
+        # Strip the usage stats footer that gh copilot appends
+        output = result.stdout
+        footer_idx = output.find("\nTotal usage est:")
+        if footer_idx != -1:
+            output = output[:footer_idx]
+        return output.strip()
 
     else:
         raise RuntimeError(
@@ -181,7 +204,7 @@ def call_llm(provider: dict, system_prompt: str, user_msg: str) -> str:
             "  - PODCAST_API_URL + PODCAST_API_TOKEN (any OpenAI-compatible API)\n"
             "  - OPENAI_API_KEY\n"
             "  - ANTHROPIC_API_KEY\n"
-            "  - Install GitHub CLI with Copilot extension"
+            "  - GitHub CLI: `gh auth login` (uses gh copilot -p)"
         )
 
 
@@ -221,8 +244,11 @@ def parse_script(script_text: str) -> list[tuple[str, str]]:
     return lines
 
 
-def synthesize_audio(lines: list[tuple[str, str]], progress_callback=None) -> AudioSegment:
+def synthesize_audio(lines: list[tuple[str, str]], progress_callback=None):
     """Generate audio from dialogue lines using Kokoro TTS."""
+    import numpy as np
+    import soundfile as sf
+    from pydub import AudioSegment
     from kokoro_onnx import Kokoro
 
     print(f"[tts] Loading Kokoro model...", flush=True)
