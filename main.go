@@ -1890,9 +1890,96 @@ const indexHTML = `<!DOCTYPE html>
     .markdown-body input[type="checkbox"] {
       cursor: pointer;
     }
+
+    /* Sidebar backdrop (mobile overlay) */
+    .sidebar-backdrop {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.5);
+      z-index: 199;
+    }
+
+    /* Hamburger button — hidden on desktop */
+    .mobile-menu-btn {
+      display: none;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--button-bg);
+      color: var(--text);
+      padding: 6px 10px;
+      cursor: pointer;
+      font-size: 18px;
+      line-height: 1;
+      font-family: inherit;
+    }
+    .mobile-menu-btn:hover { background: var(--button-hover); }
+
+    @media (max-width: 768px) {
+      /* Stack layout: sidebar is an overlay, main fills full width */
+      .app {
+        display: block;
+      }
+      .app.sidebar-hidden {
+        display: block;
+      }
+
+      /* Sidebar becomes a fixed drawer */
+      .sidebar {
+        position: fixed;
+        left: 0;
+        top: 0;
+        height: 100vh;
+        width: 280px;
+        z-index: 200;
+        transform: translateX(0);
+        transition: transform 0.25s ease;
+        box-shadow: 4px 0 20px rgba(0,0,0,0.4);
+      }
+
+      /* When hidden on mobile: slide out instead of display:none */
+      .app.sidebar-hidden .sidebar {
+        display: block !important;
+        transform: translateX(-100%);
+      }
+
+      /* Backdrop visible when sidebar is open on mobile */
+      .app:not(.sidebar-hidden) .sidebar-backdrop {
+        display: block;
+      }
+
+      /* Show hamburger, hide desktop sidebar toggle */
+      .mobile-menu-btn { display: inline-flex; align-items: center; }
+      #toggle-sidebar-btn { display: none; }
+
+      .main { padding: 12px; }
+      .viewer { padding: 12px; }
+
+      /* Larger touch targets in file tree */
+      .tree-item {
+        height: 36px;
+        line-height: 36px;
+        padding-top: 0;
+        padding-bottom: 0;
+      }
+      .tree-chevron, .tree-icon { height: 36px; }
+
+      /* Header wraps on small screens */
+      .header { flex-wrap: wrap; }
+      .header-actions {
+        flex-wrap: wrap;
+        gap: 6px;
+        width: 100%;
+      }
+      .header h2 { font-size: 16px; }
+
+      /* Shrink buttons a bit */
+      .btn { padding: 5px 8px; font-size: 12px; }
+    }
   </style>
 </head>
 <body>
+  <div class="sidebar-backdrop" id="sidebar-backdrop"></div>
   <div class="app">
     <aside class="sidebar">
       <h1>Markdown Files</h1>
@@ -1920,6 +2007,7 @@ const indexHTML = `<!DOCTYPE html>
           <div class="header-tags hidden" id="header-tags"></div>
         </div>
         <div class="header-actions">
+          <button class="mobile-menu-btn" id="mobile-menu-btn" type="button" aria-label="Open sidebar">&#9776;</button>
           <button id="prev-file-btn" class="btn nav-btn hidden" type="button" title="Previous file">&#9664; Prev</button>
           <button id="next-file-btn" class="btn nav-btn hidden" type="button" title="Next file">Next &#9654;</button>
           <button id="toggle-sidebar-btn" class="btn" type="button">Hide Sidebar</button>
@@ -1954,6 +2042,8 @@ const indexHTML = `<!DOCTYPE html>
     const rawContainerEl = document.getElementById('raw-content');
     const rawCodeEl = document.getElementById('raw-code');
     const toggleSidebarBtn = document.getElementById('toggle-sidebar-btn');
+    const mobileMenuBtn = document.getElementById('mobile-menu-btn');
+    const sidebarBackdrop = document.getElementById('sidebar-backdrop');
     const themeToggleBtn = document.getElementById('theme-toggle-btn');
     const toggleRawBtn = document.getElementById('toggle-raw-btn');
     const prevFileBtn = document.getElementById('prev-file-btn');
@@ -2001,6 +2091,14 @@ const indexHTML = `<!DOCTYPE html>
 
     toggleSidebarBtn.addEventListener('click', () => {
       applySidebarVisibility(!sidebarHidden, true);
+    });
+
+    mobileMenuBtn.addEventListener('click', () => {
+      applySidebarVisibility(false, true);
+    });
+
+    sidebarBackdrop.addEventListener('click', () => {
+      applySidebarVisibility(true, true);
     });
 
     themeToggleBtn.addEventListener('click', () => {
@@ -2241,7 +2339,9 @@ const indexHTML = `<!DOCTYPE html>
         renderFileList();
         _lastFileHash = fileListHash(files) + JSON.stringify(Object.values(fileMeta));
 
-        applySidebarVisibility(isFullscreenMode(params), false);
+        // On mobile, default to sidebar-hidden unless URL explicitly shows sidebar
+        const mobileDefault = window.innerWidth <= 768 && params.get('sidebar') === null;
+        applySidebarVisibility(mobileDefault || isFullscreenMode(params), false);
         const requested = params.get('file') || INITIAL_FILE;
         if (requested && files.includes(requested)) {
           await openFile(requested, false);
@@ -2544,6 +2644,11 @@ const indexHTML = `<!DOCTYPE html>
         toggleRawBtn.classList.remove('hidden');
         updateNavButtons();
         renderHeaderTags();
+
+        // Auto-close sidebar on mobile when a file is opened
+        if (window.innerWidth <= 768 && !sidebarHidden) {
+          applySidebarVisibility(true, false);
+        }
 
         // Mark as opened if not already
         if (!fileOpened[activeFile]) {
