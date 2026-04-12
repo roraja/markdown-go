@@ -1150,7 +1150,7 @@ func listMarkdownFiles(root string) ([]string, error) {
 		if d.IsDir() {
 			return nil
 		}
-		if !isMarkdownFile(d.Name()) {
+		if !isMarkdownFile(d.Name()) && !isPDFFile(d.Name()) {
 			return nil
 		}
 
@@ -1172,6 +1172,10 @@ func listMarkdownFiles(root string) ([]string, error) {
 func isMarkdownFile(path string) bool {
 	ext := strings.ToLower(filepath.Ext(path))
 	return ext == ".md" || ext == ".markdown"
+}
+
+func isPDFFile(path string) bool {
+	return strings.ToLower(filepath.Ext(path)) == ".pdf"
 }
 
 func sanitizeRelativePath(path string) (string, error) {
@@ -2531,7 +2535,9 @@ const indexHTML = `<!DOCTYPE html>
 
         const icon = document.createElement('span');
         icon.className = 'tree-icon file-icon';
-        icon.innerHTML = '&#128462;';
+        const isPDF = file.path.toLowerCase().endsWith('.pdf');
+        icon.innerHTML = isPDF ? '&#128196;' : '&#128462;';
+        if (isPDF) icon.style.color = '#e74c3c';
 
         const label = document.createElement('span');
         label.className = 'tree-label';
@@ -2559,7 +2565,7 @@ const indexHTML = `<!DOCTYPE html>
         }
 
         const tags = getEffectiveTags(fullFilePath);
-        if (tags.length > 0) {
+        if (!isPDF && tags.length > 0) {
           const tagSpan = document.createElement('span');
           tagSpan.className = 'tree-tag';
           tagSpan.textContent = tags.map(t => TAG_ICONS[t] || '').filter(Boolean).join('');
@@ -2571,6 +2577,7 @@ const indexHTML = `<!DOCTYPE html>
           openFile(fullFilePath, true);
         });
         btn.addEventListener('contextmenu', (e) => {
+          if (isPDF) return;
           e.preventDefault();
           showTagMenu(e.clientX, e.clientY, fullFilePath);
         });
@@ -2628,6 +2635,51 @@ const indexHTML = `<!DOCTYPE html>
 
     async function openFile(filePath, pushState, searchQuery) {
       try {
+        // Force exit raw/edit mode before rendering anything
+        if (showingRaw) {
+          showingRaw = false;
+          renderedEl.classList.remove('hidden');
+          rawContainerEl.classList.add('hidden');
+          toggleRawBtn.textContent = 'Show Raw';
+        }
+
+        if (filePath.toLowerCase().endsWith('.pdf')) {
+          activeFile = filePath;
+          rawContent = '';
+          fileNameEl.textContent = activeFile;
+          document.title = filePath.split('/').pop() + ' - Markdown Viewer';
+
+          const encodedPath = filePath.split('/').map(s => encodeURIComponent(s)).join('/');
+          const mediaURL = '/api/media/' + encodedPath;
+          renderedEl.innerHTML =
+            '<div style="display:flex;flex-direction:column;height:80vh;gap:8px;">' +
+              '<div style="display:flex;gap:8px;">' +
+                '<a href="' + mediaURL + '" target="_blank" class="btn" style="text-decoration:none;">Open in new tab ↗</a>' +
+                '<a href="' + mediaURL + '" download class="btn" style="text-decoration:none;">Download ⬇</a>' +
+              '</div>' +
+              '<iframe src="' + mediaURL + '" style="flex:1;width:100%;border:1px solid var(--border);border-radius:6px;"></iframe>' +
+            '</div>';
+          toggleRawBtn.classList.add('hidden');
+          highlightActiveFile();
+          updateNavButtons();
+          renderHeaderTags();
+
+          // Auto-close sidebar on mobile
+          if (window.innerWidth <= 768 && !sidebarHidden) {
+            applySidebarVisibility(true, false);
+          }
+
+          if (pushState) {
+            const url = new URL(window.location.href);
+            url.searchParams.set('file', activeFile);
+            if (baseFolderPath) url.searchParams.set('baseFolderPath', baseFolderPath);
+            url.searchParams.set('sidebar', sidebarHidden ? '0' : '1');
+            url.searchParams.delete('fullscreen');
+            window.history.pushState({ file: activeFile, sidebar: !sidebarHidden }, '', url);
+          }
+          return;
+        }
+
         const response = await fetch('/api/file?path=' + encodeURIComponent(filePath));
         if (!response.ok) throw new Error('failed to load file');
         const payload = await response.json();
@@ -3116,8 +3168,13 @@ const indexHTML = `<!DOCTYPE html>
     const _origOpenFile = openFile;
     openFile = async function(filePath, pushState, searchQuery) {
       await _origOpenFile(filePath, pushState, searchQuery);
+      const isMarkdown = !filePath.toLowerCase().endsWith('.pdf');
       attachCheckboxHandlers();
-      editBtn.classList.remove('hidden');
+      if (isMarkdown) {
+        editBtn.classList.remove('hidden');
+      } else {
+        editBtn.classList.add('hidden');
+      }
       if (editMode) exitEditMode();
       checkPodcastStatus(filePath);
     };
