@@ -1720,6 +1720,16 @@ const indexHTML = `<!DOCTYPE html>
     }
     .markdown-body a:hover { text-decoration: underline; }
 
+    .markdown-body img {
+      max-width: 100%;
+      height: auto;
+      display: block;
+      margin: 12px 0;
+      border-radius: 6px;
+    }
+    .markdown-body a img { display: inline-block; }
+    .markdown-body td img, .markdown-body th img { display: inline-block; margin: 0; }
+
     .mermaid-block {
       background: #fff;
       border-radius: 8px;
