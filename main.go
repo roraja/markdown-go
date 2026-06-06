@@ -24,6 +24,10 @@ import (
 //go:embed podcast_gen.py
 var embeddedPodcastScript []byte
 
+// version is the build version. It defaults to "dev" for local builds and is
+// overridden at release time via -ldflags "-X main.version=<tag>".
+var version = "dev"
+
 const mdviewerFile = ".mdviewer"
 
 // mdviewerDataDir returns the path to the mdviewer data directory
@@ -199,7 +203,13 @@ func main() {
 	rootFlag := flag.String("root", ".", "Root directory to scan for markdown files")
 	portFlag := flag.String("port", "8080", "HTTP port to listen on")
 	podcastWatchFlag := flag.String("podcast-watch", "", "Comma-separated list of directories (relative to -root) to watch for auto podcast generation")
+	versionFlag := flag.Bool("version", false, "Print version and exit")
 	flag.Parse()
+
+	if *versionFlag {
+		fmt.Printf("mdviewer %s\n", version)
+		return
+	}
 
 	absRoot, err := filepath.Abs(*rootFlag)
 	if err != nil {

@@ -97,6 +97,12 @@ The sidebar **live-updates** every 5 seconds — new files, deletions, and modif
 - `-root` (default `.`): Root directory scanned recursively for Markdown files.
 - `-port` (default `8080`): HTTP port to listen on.
 - `-podcast-watch` (optional): Comma-separated list of directories and/or glob patterns to watch for auto podcast generation.
+- `-version`: Print the version and exit.
+
+```bash
+mdviewer -version
+# mdviewer v1.12.0
+```
 
 ### Auto Podcast Generation (`-podcast-watch`)
 
