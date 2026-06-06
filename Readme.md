@@ -1,6 +1,6 @@
 # mdviewer-go
 
-A lightweight local web app to browse and render Markdown files (`.md`, `.markdown`) from a folder.
+A lightweight local web app to browse and render Markdown files (`.md`, `.markdown`) from a folder. It can also view PDFs, HTML files, and images (`.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.svg`, `.bmp`, `.ico`, `.avif`) found in the same folder tree.
 
 ## Quick Install
 

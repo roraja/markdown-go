@@ -1,16 +1,17 @@
 package main
 
 import (
+	"bufio"
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"html/template"
+	"io"
 	"io/fs"
 	"log"
 	"net/http"
-	"bufio"
-	_ "embed"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,7 +19,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"io"
 )
 
 //go:embed podcast_gen.py
@@ -70,8 +70,8 @@ type app struct {
 	tpl  *template.Template
 
 	// Podcast generation state
-	podcastMu    sync.Mutex
-	podcastJobs  map[string]*podcastJob // keyed by relative md path
+	podcastMu   sync.Mutex
+	podcastJobs map[string]*podcastJob // keyed by relative md path
 }
 
 type podcastJob struct {
@@ -1150,7 +1150,7 @@ func listMarkdownFiles(root string) ([]string, error) {
 		if d.IsDir() {
 			return nil
 		}
-		if !isMarkdownFile(d.Name()) && !isPDFFile(d.Name()) {
+		if !isViewableFile(d.Name()) {
 			return nil
 		}
 
@@ -1176,6 +1176,26 @@ func isMarkdownFile(path string) bool {
 
 func isPDFFile(path string) bool {
 	return strings.ToLower(filepath.Ext(path)) == ".pdf"
+}
+
+func isHTMLFile(path string) bool {
+	ext := strings.ToLower(filepath.Ext(path))
+	return ext == ".html" || ext == ".htm"
+}
+
+func isImageFile(path string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".ico", ".avif":
+		return true
+	default:
+		return false
+	}
+}
+
+// isViewableFile reports whether the file can be shown in the viewer sidebar
+// and content area: markdown, PDF, HTML, or image files.
+func isViewableFile(path string) bool {
+	return isMarkdownFile(path) || isPDFFile(path) || isHTMLFile(path) || isImageFile(path)
 }
 
 func sanitizeRelativePath(path string) (string, error) {
@@ -2071,6 +2091,14 @@ const indexHTML = `<!DOCTYPE html>
     const sortToggleBtn = document.getElementById('sort-toggle-btn');
     const STORAGE_THEME_KEY = 'mdviewer-theme';
 
+    // --- File type helpers (keep in sync with backend) ---
+    const IMAGE_EXTS = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.bmp', '.ico', '.avif'];
+    function isPdfPath(p) { return p.toLowerCase().endsWith('.pdf'); }
+    function isHtmlPath(p) { const l = p.toLowerCase(); return l.endsWith('.html') || l.endsWith('.htm'); }
+    function isImagePath(p) { const l = p.toLowerCase(); return IMAGE_EXTS.some(e => l.endsWith(e)); }
+    function isMarkdownPath(p) { const l = p.toLowerCase(); return l.endsWith('.md') || l.endsWith('.markdown'); }
+    function mediaUrlFor(p) { return '/api/media/' + p.split('/').map(s => encodeURIComponent(s)).join('/'); }
+
     let files = [];
     let activeFile = '';
     let rawContent = '';
@@ -2545,9 +2573,22 @@ const indexHTML = `<!DOCTYPE html>
 
         const icon = document.createElement('span');
         icon.className = 'tree-icon file-icon';
-        const isPDF = file.path.toLowerCase().endsWith('.pdf');
-        icon.innerHTML = isPDF ? '&#128196;' : '&#128462;';
-        if (isPDF) icon.style.color = '#e74c3c';
+        const isPDF = isPdfPath(file.path);
+        const isHTML = isHtmlPath(file.path);
+        const isImage = isImagePath(file.path);
+        const isViewerOnly = isPDF || isHTML || isImage;
+        if (isPDF) {
+          icon.innerHTML = '&#128196;'; // page
+          icon.style.color = '#e74c3c';
+        } else if (isHTML) {
+          icon.innerHTML = '&#127760;'; // globe
+          icon.style.color = '#e67e22';
+        } else if (isImage) {
+          icon.innerHTML = '&#128247;'; // camera
+          icon.style.color = '#3498db';
+        } else {
+          icon.innerHTML = '&#128462;';
+        }
 
         const label = document.createElement('span');
         label.className = 'tree-label';
@@ -2575,7 +2616,7 @@ const indexHTML = `<!DOCTYPE html>
         }
 
         const tags = getEffectiveTags(fullFilePath);
-        if (!isPDF && tags.length > 0) {
+        if (!isViewerOnly && tags.length > 0) {
           const tagSpan = document.createElement('span');
           tagSpan.className = 'tree-tag';
           tagSpan.textContent = tags.map(t => TAG_ICONS[t] || '').filter(Boolean).join('');
@@ -2587,7 +2628,7 @@ const indexHTML = `<!DOCTYPE html>
           openFile(fullFilePath, true);
         });
         btn.addEventListener('contextmenu', (e) => {
-          if (isPDF) return;
+          if (isViewerOnly) return;
           e.preventDefault();
           showTagMenu(e.clientX, e.clientY, fullFilePath);
         });
@@ -2653,22 +2694,41 @@ const indexHTML = `<!DOCTYPE html>
           toggleRawBtn.textContent = 'Show Raw';
         }
 
-        if (filePath.toLowerCase().endsWith('.pdf')) {
+        if (isPdfPath(filePath) || isHtmlPath(filePath) || isImagePath(filePath)) {
           activeFile = filePath;
           rawContent = '';
           fileNameEl.textContent = activeFile;
           document.title = filePath.split('/').pop() + ' - Markdown Viewer';
 
-          const encodedPath = filePath.split('/').map(s => encodeURIComponent(s)).join('/');
-          const mediaURL = '/api/media/' + encodedPath;
-          renderedEl.innerHTML =
-            '<div style="display:flex;flex-direction:column;height:80vh;gap:8px;">' +
-              '<div style="display:flex;gap:8px;">' +
-                '<a href="' + mediaURL + '" target="_blank" class="btn" style="text-decoration:none;">Open in new tab ↗</a>' +
-                '<a href="' + mediaURL + '" download class="btn" style="text-decoration:none;">Download ⬇</a>' +
-              '</div>' +
-              '<iframe src="' + mediaURL + '" style="flex:1;width:100%;border:1px solid var(--border);border-radius:6px;"></iframe>' +
-            '</div>';
+          const mediaURL = mediaUrlFor(filePath);
+          let viewer;
+          if (isImagePath(filePath)) {
+            viewer =
+              '<div style="display:flex;flex-direction:column;gap:8px;">' +
+                '<div style="display:flex;gap:8px;">' +
+                  '<a href="' + mediaURL + '" target="_blank" class="btn" style="text-decoration:none;">Open in new tab ↗</a>' +
+                  '<a href="' + mediaURL + '" download class="btn" style="text-decoration:none;">Download ⬇</a>' +
+                '</div>' +
+                '<div style="text-align:center;"><img src="' + mediaURL + '" alt="' + activeFile + '" style="max-width:100%;height:auto;border:1px solid var(--border);border-radius:6px;" /></div>' +
+              '</div>';
+          } else {
+            // PDF and HTML render in an iframe. HTML is sandboxed in an opaque
+            // origin: scripts/relative assets still render for self-contained
+            // pages, but the framed file cannot script the viewer or read its
+            // origin storage.
+            const sandboxAttr = isHtmlPath(filePath)
+              ? ' sandbox="allow-scripts allow-popups allow-forms allow-modals"'
+              : '';
+            viewer =
+              '<div style="display:flex;flex-direction:column;height:80vh;gap:8px;">' +
+                '<div style="display:flex;gap:8px;">' +
+                  '<a href="' + mediaURL + '" target="_blank" class="btn" style="text-decoration:none;">Open in new tab ↗</a>' +
+                  '<a href="' + mediaURL + '" download class="btn" style="text-decoration:none;">Download ⬇</a>' +
+                '</div>' +
+                '<iframe src="' + mediaURL + '"' + sandboxAttr + ' style="flex:1;width:100%;border:1px solid var(--border);border-radius:6px;background:#fff;"></iframe>' +
+              '</div>';
+          }
+          renderedEl.innerHTML = viewer;
           toggleRawBtn.classList.add('hidden');
           highlightActiveFile();
           updateNavButtons();
@@ -3178,7 +3238,7 @@ const indexHTML = `<!DOCTYPE html>
     const _origOpenFile = openFile;
     openFile = async function(filePath, pushState, searchQuery) {
       await _origOpenFile(filePath, pushState, searchQuery);
-      const isMarkdown = !filePath.toLowerCase().endsWith('.pdf');
+      const isMarkdown = isMarkdownPath(filePath);
       attachCheckboxHandlers();
       if (isMarkdown) {
         editBtn.classList.remove('hidden');
