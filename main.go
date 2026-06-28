@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -30,6 +31,10 @@ var embeddedPodcastScript []byte
 var version = "dev"
 
 const mdviewerFile = ".mdviewer"
+
+// githubRepo is the "owner/name" used by the self-update command to locate
+// release assets.
+const githubRepo = "roraja/markdown-go"
 
 // mdviewerDataDir returns the path to the mdviewer data directory
 // (~/.local/mdviewer), creating it if it doesn't exist.
@@ -93,8 +98,17 @@ type pageData struct {
 }
 
 type mdviewerData struct {
-	Tags   map[string][]string `json:"tags"`
-	Opened map[string]bool     `json:"opened"`
+	Tags     map[string][]string `json:"tags"`
+	Opened   map[string]bool     `json:"opened"`
+	LogViews []logViewEntry      `json:"logViews,omitempty"`
+}
+
+// logViewEntry is a saved, Notion-like log view (filters + column config)
+// stored in a .mdviewer file. It applies to all log files in that directory
+// and its subdirectories.
+type logViewEntry struct {
+	Name   string          `json:"name"`
+	Config json.RawMessage `json:"config"`
 }
 
 // mdviewerDataLegacy handles the old single-tag format for migration.
@@ -137,7 +151,7 @@ func readMdviewerFile(dirPath string) (mdviewerData, error) {
 
 func writeMdviewerFile(dirPath string, data mdviewerData) error {
 	fp := filepath.Join(dirPath, mdviewerFile)
-	if len(data.Tags) == 0 && len(data.Opened) == 0 {
+	if len(data.Tags) == 0 && len(data.Opened) == 0 && len(data.LogViews) == 0 {
 		_ = os.Remove(fp)
 		return nil
 	}
@@ -205,10 +219,18 @@ func main() {
 	portFlag := flag.String("port", "8080", "HTTP port to listen on")
 	podcastWatchFlag := flag.String("podcast-watch", "", "Comma-separated list of directories (relative to -root) to watch for auto podcast generation")
 	versionFlag := flag.Bool("version", false, "Print version and exit")
+	updateFlag := flag.Bool("update", false, "Update mdviewer to the latest GitHub release and exit")
 	flag.Parse()
 
 	if *versionFlag {
 		fmt.Printf("mdviewer %s\n", version)
+		return
+	}
+
+	if *updateFlag {
+		if err := selfUpdate(); err != nil {
+			log.Fatalf("update failed: %v", err)
+		}
 		return
 	}
 
@@ -242,6 +264,9 @@ func main() {
 	mux.HandleFunc("/api/file", a.handleFile)
 	mux.HandleFunc("/api/log", a.handleLogTail)
 	mux.HandleFunc("/api/log/clear", a.handleLogClear)
+	mux.HandleFunc("/api/log/views", a.handleLogViews)
+	mux.HandleFunc("/api/log/views/save", a.handleLogViewSave)
+	mux.HandleFunc("/api/log/views/delete", a.handleLogViewDelete)
 	mux.HandleFunc("/api/search", a.handleSearch)
 	mux.HandleFunc("/api/tags", a.handleTags)
 	mux.HandleFunc("/api/tag", a.handleSetTag)
@@ -282,6 +307,137 @@ func main() {
 	if err := http.ListenAndServe(addr, mux); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// releaseAssetName returns the release asset file name for the current
+// platform, matching the names produced by .github/workflows/release.yml.
+func releaseAssetName() string {
+	osName := runtime.GOOS
+	if osName == "darwin" {
+		osName = "macos"
+	}
+	ext := ""
+	if runtime.GOOS == "windows" {
+		ext = ".exe"
+	}
+	return fmt.Sprintf("mdviewer-%s-%s%s", osName, runtime.GOARCH, ext)
+}
+
+// selfUpdate downloads the latest release binary for this platform from
+// GitHub and replaces the currently running executable in place.
+func selfUpdate() error {
+	assetName := releaseAssetName()
+	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", githubRepo)
+
+	client := &http.Client{Timeout: 60 * time.Second}
+	req, err := http.NewRequest(http.MethodGet, apiURL, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("User-Agent", "mdviewer-self-update")
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("query latest release: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("GitHub API returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
+	}
+
+	var release struct {
+		TagName string `json:"tag_name"`
+		Assets  []struct {
+			Name               string `json:"name"`
+			BrowserDownloadURL string `json:"browser_download_url"`
+		} `json:"assets"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
+		return fmt.Errorf("decode release: %w", err)
+	}
+
+	fmt.Printf("Current version: %s\n", version)
+	fmt.Printf("Latest release:  %s\n", release.TagName)
+	if release.TagName != "" && ("v"+version == release.TagName || version == release.TagName) {
+		fmt.Println("Already up to date.")
+		return nil
+	}
+
+	var downloadURL string
+	for _, asset := range release.Assets {
+		if asset.Name == assetName {
+			downloadURL = asset.BrowserDownloadURL
+			break
+		}
+	}
+	if downloadURL == "" {
+		return fmt.Errorf("no release asset %q found in %s", assetName, release.TagName)
+	}
+
+	exePath, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("locate executable: %w", err)
+	}
+	exePath, err = filepath.EvalSymlinks(exePath)
+	if err != nil {
+		return fmt.Errorf("resolve executable: %w", err)
+	}
+
+	fmt.Printf("Downloading %s …\n", assetName)
+	dlReq, err := http.NewRequest(http.MethodGet, downloadURL, nil)
+	if err != nil {
+		return err
+	}
+	dlReq.Header.Set("User-Agent", "mdviewer-self-update")
+	dlResp, err := client.Do(dlReq)
+	if err != nil {
+		return fmt.Errorf("download binary: %w", err)
+	}
+	defer dlResp.Body.Close()
+	if dlResp.StatusCode != http.StatusOK {
+		return fmt.Errorf("download returned %s", dlResp.Status)
+	}
+
+	dir := filepath.Dir(exePath)
+	tmp, err := os.CreateTemp(dir, ".mdviewer-update-*")
+	if err != nil {
+		return fmt.Errorf("create temp file (need write access to %s): %w", dir, err)
+	}
+	tmpName := tmp.Name()
+	if _, err := io.Copy(tmp, dlResp.Body); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return fmt.Errorf("write binary: %w", err)
+	}
+	tmp.Close()
+	if err := os.Chmod(tmpName, 0o755); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+
+	if runtime.GOOS == "windows" {
+		// A running .exe can't be overwritten on Windows; move it aside first.
+		old := exePath + ".old"
+		os.Remove(old)
+		if err := os.Rename(exePath, old); err != nil {
+			os.Remove(tmpName)
+			return fmt.Errorf("replace executable: %w", err)
+		}
+		if err := os.Rename(tmpName, exePath); err != nil {
+			os.Rename(old, exePath)
+			return fmt.Errorf("install new executable: %w", err)
+		}
+		os.Remove(old)
+	} else {
+		if err := os.Rename(tmpName, exePath); err != nil {
+			os.Remove(tmpName)
+			return fmt.Errorf("replace executable at %s: %w", exePath, err)
+		}
+	}
+
+	fmt.Printf("Updated mdviewer to %s at %s\n", release.TagName, exePath)
+	return nil
 }
 
 func (a *app) handleIndex(w http.ResponseWriter, r *http.Request) {
@@ -533,6 +689,211 @@ func (a *app) handleLogClear(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true})
+}
+
+// logViewResponse is a saved view returned to the client, annotated with the
+// directory (relative to root) of the .mdviewer file that stores it so the
+// client can later delete it from the correct place.
+type logViewResponse struct {
+	Name   string          `json:"name"`
+	Config json.RawMessage `json:"config"`
+	Dir    string          `json:"dir"`
+}
+
+// logViewDirs returns the chain of directories (relative to root, root-first)
+// from the root down to the directory containing relPath. These are the
+// directories whose .mdviewer views apply to relPath.
+func logViewDirs(relPath string) []string {
+	dir := filepath.ToSlash(filepath.Dir(relPath))
+	dirs := []string{""}
+	if dir == "." || dir == "" {
+		return dirs
+	}
+	parts := strings.Split(dir, "/")
+	cur := ""
+	for _, p := range parts {
+		if cur == "" {
+			cur = p
+		} else {
+			cur = cur + "/" + p
+		}
+		dirs = append(dirs, cur)
+	}
+	return dirs
+}
+
+// handleLogViews returns all saved log views applicable to a log file: those
+// stored in the file's own directory and any ancestor up to the root. Views
+// declared deeper in the tree override same-named ancestors.
+func (a *app) handleLogViews(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	relPath, err := sanitizeRelativePath(r.URL.Query().Get("path"))
+	if err != nil {
+		http.Error(w, "invalid path", http.StatusBadRequest)
+		return
+	}
+
+	byName := make(map[string]logViewResponse)
+	var order []string
+	for _, relDir := range logViewDirs(relPath) {
+		dirFull, derr := secureJoin(a.root, relDir)
+		if relDir == "" {
+			dirFull = a.root
+			derr = nil
+		}
+		if derr != nil {
+			continue
+		}
+		data, rerr := readMdviewerFile(dirFull)
+		if rerr != nil {
+			continue
+		}
+		for _, v := range data.LogViews {
+			if _, exists := byName[v.Name]; !exists {
+				order = append(order, v.Name)
+			}
+			byName[v.Name] = logViewResponse{Name: v.Name, Config: v.Config, Dir: relDir}
+		}
+	}
+
+	views := make([]logViewResponse, 0, len(order))
+	for _, n := range order {
+		views = append(views, byName[n])
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(map[string]any{"views": views})
+}
+
+// handleLogViewSave upserts a named view into the .mdviewer file of the log
+// file's own directory, making it available to that directory and all
+// subdirectories.
+func (a *app) handleLogViewSave(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	relPath, err := sanitizeRelativePath(r.URL.Query().Get("path"))
+	if err != nil {
+		http.Error(w, "invalid path", http.StatusBadRequest)
+		return
+	}
+
+	var body struct {
+		Name   string          `json:"name"`
+		Config json.RawMessage `json:"config"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid body", http.StatusBadRequest)
+		return
+	}
+	body.Name = strings.TrimSpace(body.Name)
+	if body.Name == "" {
+		http.Error(w, "name is required", http.StatusBadRequest)
+		return
+	}
+	if len(body.Config) == 0 {
+		body.Config = json.RawMessage("{}")
+	}
+
+	relDir := filepath.ToSlash(filepath.Dir(relPath))
+	var dirFull string
+	if relDir == "." || relDir == "" {
+		relDir = ""
+		dirFull = a.root
+	} else {
+		dirFull, err = secureJoin(a.root, relDir)
+		if err != nil {
+			http.Error(w, "invalid path", http.StatusBadRequest)
+			return
+		}
+	}
+
+	data, err := readMdviewerFile(dirFull)
+	if err != nil {
+		http.Error(w, "failed to read views", http.StatusInternalServerError)
+		return
+	}
+	updated := false
+	for i := range data.LogViews {
+		if data.LogViews[i].Name == body.Name {
+			data.LogViews[i].Config = body.Config
+			updated = true
+			break
+		}
+	}
+	if !updated {
+		data.LogViews = append(data.LogViews, logViewEntry{Name: body.Name, Config: body.Config})
+	}
+	if err := writeMdviewerFile(dirFull, data); err != nil {
+		http.Error(w, "failed to save view", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "dir": relDir})
+}
+
+// handleLogViewDelete removes a named view. It searches from the log file's
+// own directory upward to the root and deletes the first match.
+func (a *app) handleLogViewDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	relPath, err := sanitizeRelativePath(r.URL.Query().Get("path"))
+	if err != nil {
+		http.Error(w, "invalid path", http.StatusBadRequest)
+		return
+	}
+	var body struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid body", http.StatusBadRequest)
+		return
+	}
+	body.Name = strings.TrimSpace(body.Name)
+	if body.Name == "" {
+		http.Error(w, "name is required", http.StatusBadRequest)
+		return
+	}
+
+	dirs := logViewDirs(relPath)
+	// Search deepest-first so a delete removes the most specific definition.
+	for i := len(dirs) - 1; i >= 0; i-- {
+		relDir := dirs[i]
+		dirFull := a.root
+		if relDir != "" {
+			dirFull, err = secureJoin(a.root, relDir)
+			if err != nil {
+				continue
+			}
+		}
+		data, rerr := readMdviewerFile(dirFull)
+		if rerr != nil {
+			continue
+		}
+		idx := -1
+		for j := range data.LogViews {
+			if data.LogViews[j].Name == body.Name {
+				idx = j
+				break
+			}
+		}
+		if idx >= 0 {
+			data.LogViews = append(data.LogViews[:idx], data.LogViews[idx+1:]...)
+			if err := writeMdviewerFile(dirFull, data); err != nil {
+				http.Error(w, "failed to delete view", http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true})
+			return
+		}
+	}
+	http.Error(w, "view not found", http.StatusNotFound)
 }
 
 func (a *app) handleSearch(w http.ResponseWriter, r *http.Request) {
@@ -2197,19 +2558,58 @@ const indexHTML = `<!DOCTYPE html>
     }
     .log-line.log-hit { background: rgba(255, 221, 0, 0.18); }
     .log-table-wrap { max-height: calc(100vh - 220px); overflow: auto; border: 1px solid var(--border); border-radius: 6px; }
-    table.log-table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
+    table.log-table { border-collapse: collapse; width: 100%; font-size: 12.5px; table-layout: fixed; }
     table.log-table th, table.log-table td {
       border: 1px solid var(--border); padding: 4px 8px; text-align: left;
       vertical-align: top; font-family: ui-monospace, Menlo, Consolas, monospace;
-      max-width: 480px; overflow-wrap: anywhere;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     }
-    table.log-table th { position: sticky; top: 0; background: var(--bg); z-index: 2; cursor: default; }
-    table.log-table tr.log-raw-row td { font-style: italic; color: var(--muted); }
+    table.log-table td { white-space: pre-wrap; overflow-wrap: anywhere; }
+    table.log-table th {
+      position: sticky; top: 0; background: var(--bg); z-index: 2;
+      position: relative; user-select: none;
+    }
+    table.log-table thead tr.log-filter-row th { top: 28px; padding: 2px; }
+    table.log-table thead tr.log-filter-row input.log-col-filter {
+      width: 100%; box-sizing: border-box; padding: 2px 5px; font-size: 11px;
+      border: 1px solid var(--border); border-radius: 4px; background: var(--bg); color: var(--fg);
+      font-family: inherit;
+    }
+    .log-th-label { display: inline-block; max-width: calc(100% - 8px); overflow: hidden; text-overflow: ellipsis; vertical-align: bottom; }
+    .log-col-resizer {
+      position: absolute; top: 0; right: 0; width: 7px; height: 100%;
+      cursor: col-resize; z-index: 3;
+    }
+    .log-col-resizer:hover { background: rgba(88,166,255,0.4); }
+    table.log-table tr.log-raw-row td { font-style: italic; color: var(--muted); white-space: pre-wrap; }
     .log-badge { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 11px; font-weight: 600; color: #fff; }
     .log-lvl-error, .log-lvl-fatal, .log-lvl-critical { background: #e74c3c; }
     .log-lvl-warn, .log-lvl-warning { background: #e67e22; }
     .log-lvl-info { background: #3498db; }
     .log-lvl-debug, .log-lvl-trace { background: #7f8c8d; }
+
+    /* Dropdown menus (columns / views) */
+    .log-dropdown { position: relative; display: inline-block; }
+    .log-menu {
+      position: absolute; top: calc(100% + 4px); left: 0; z-index: 50;
+      min-width: 220px; max-height: 60vh; overflow: auto;
+      background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.25); padding: 6px;
+    }
+    .log-menu-title { font-size: 11px; font-weight: 700; color: var(--muted); text-transform: uppercase; padding: 4px 6px; }
+    .log-menu-empty { font-size: 12px; color: var(--muted); padding: 6px; }
+    .log-menu-row {
+      display: flex; align-items: center; gap: 6px; padding: 4px 6px;
+      font-size: 13px; border-radius: 5px; cursor: pointer;
+    }
+    .log-menu-row:hover { background: rgba(127,127,127,0.12); }
+    .log-menu-actions { display: flex; gap: 6px; padding: 6px; border-top: 1px solid var(--border); margin-top: 4px; }
+    .log-view-row { justify-content: space-between; }
+    .log-view-apply { flex: 1; }
+    .log-view-scope { font-size: 10px; color: var(--muted); margin-left: 4px; }
+    .log-view-active { background: rgba(35,134,54,0.18); }
+    .log-view-del { color: #e74c3c; font-weight: 700; padding: 0 6px; }
+    .log-view-del:hover { background: rgba(231,76,60,0.15); border-radius: 4px; }
   </style>
 </head>
 <body>
@@ -3017,8 +3417,19 @@ const indexHTML = `<!DOCTYPE html>
       }
     }
 
-    // --- Log viewer (live tail, clear, JSON-as-table, filtering) ---
+    // --- Log viewer (live tail, clear, JSON table, column config, views) ---
     let logState = null;
+
+    const LOG_PREFERRED_COLS = ['time','timestamp','ts','date','level','lvl','severity','logger','name','msg','message'];
+    const LOG_LEVEL_KEYS = new Set(['level','lvl','severity']);
+
+    function logColDefaultWidth(key) {
+      const k = key.toLowerCase();
+      if (LOG_LEVEL_KEYS.has(k)) return 90;
+      if (['time','timestamp','ts','date'].includes(k)) return 200;
+      if (['msg','message'].includes(k)) return 360;
+      return 160;
+    }
 
     function stopLogTail() {
       if (logState && logState.timer) {
@@ -3034,6 +3445,44 @@ const indexHTML = `<!DOCTYPE html>
         .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
     }
 
+    function logConfigKey(path) { return 'mdviewer-logcfg:' + path; }
+
+    function captureLogConfig() {
+      const c = logState.colConfig;
+      return {
+        jsonMode: logState.jsonMode,
+        globalFilter: logState.globalFilter,
+        order: c.order.slice(),
+        hidden: Object.keys(c.hidden).filter(k => c.hidden[k]),
+        widths: Object.assign({}, c.widths),
+        filters: Object.assign({}, c.filters)
+      };
+    }
+
+    function applyLogConfig(cfg) {
+      if (!cfg) return;
+      logState.jsonMode = !!cfg.jsonMode;
+      logState.globalFilter = cfg.globalFilter || '';
+      const c = logState.colConfig;
+      c.order = Array.isArray(cfg.order) ? cfg.order.slice() : [];
+      c.hidden = {};
+      (cfg.hidden || []).forEach(k => { c.hidden[k] = true; });
+      c.widths = Object.assign({}, cfg.widths || {});
+      c.filters = Object.assign({}, cfg.filters || {});
+    }
+
+    function saveLocalLogConfig() {
+      if (!logState) return;
+      try { localStorage.setItem(logConfigKey(logState.path), JSON.stringify(captureLogConfig())); } catch (e) {}
+    }
+
+    function loadLocalLogConfig() {
+      try {
+        const raw = localStorage.getItem(logConfigKey(logState.path));
+        if (raw) applyLogConfig(JSON.parse(raw));
+      } catch (e) {}
+    }
+
     async function openLogFile(filePath, pushState) {
       stopLogTail();
       activeFile = filePath;
@@ -3042,7 +3491,15 @@ const indexHTML = `<!DOCTYPE html>
       document.title = filePath.split('/').pop() + ' - Log Viewer';
       toggleRawBtn.classList.add('hidden');
 
-      logState = { path: filePath, offset: -1, buffer: '', live: false, timer: null, jsonMode: false, filter: '' };
+      logState = {
+        path: filePath, offset: -1, buffer: '', live: false, timer: null,
+        jsonMode: false, globalFilter: '',
+        allCols: [],
+        colConfig: { order: [], hidden: {}, widths: {}, filters: {} },
+        stick: true, resizing: false,
+        views: [], currentView: ''
+      };
+      loadLocalLogConfig();
 
       renderedEl.innerHTML =
         '<div class="log-toolbar">' +
@@ -3051,7 +3508,12 @@ const indexHTML = `<!DOCTYPE html>
           '<label style="display:flex;align-items:center;gap:5px;font-size:12px;color:var(--muted);">' +
             '<input type="checkbox" id="log-json-toggle"> JSON table' +
           '</label>' +
-          '<input type="text" id="log-filter" class="log-filter" placeholder="Filter (substring, case-insensitive)…">' +
+          '<div class="log-dropdown"><button id="log-cols-btn" class="btn hidden" type="button">⚙ Columns</button>' +
+            '<div id="log-cols-menu" class="log-menu hidden"></div></div>' +
+          '<div class="log-dropdown"><button id="log-views-btn" class="btn" type="button">🔖 Views</button>' +
+            '<div id="log-views-menu" class="log-menu hidden"></div></div>' +
+          '<input type="text" id="log-filter" class="log-filter" placeholder="Filter all (substring)…">' +
+          '<span id="log-view-name" class="log-stat"></span>' +
           '<span id="log-stat" class="log-stat"></span>' +
         '</div>' +
         '<div id="log-body"></div>';
@@ -3060,11 +3522,27 @@ const indexHTML = `<!DOCTYPE html>
       const clearBtn = document.getElementById('log-clear-btn');
       const jsonToggle = document.getElementById('log-json-toggle');
       const filterInput = document.getElementById('log-filter');
+      const colsBtn = document.getElementById('log-cols-btn');
+      const viewsBtn = document.getElementById('log-views-btn');
+
+      jsonToggle.checked = logState.jsonMode;
+      filterInput.value = logState.globalFilter;
+      if (logState.jsonMode) colsBtn.classList.remove('hidden');
 
       liveBtn.addEventListener('click', () => toggleLogLive());
       clearBtn.addEventListener('click', () => clearLog());
-      jsonToggle.addEventListener('change', () => { logState.jsonMode = jsonToggle.checked; renderLog(); });
-      filterInput.addEventListener('input', () => { logState.filter = filterInput.value; renderLog(); });
+      jsonToggle.addEventListener('change', () => {
+        logState.jsonMode = jsonToggle.checked;
+        colsBtn.classList.toggle('hidden', !logState.jsonMode);
+        saveLocalLogConfig(); renderLog();
+      });
+      filterInput.addEventListener('input', () => {
+        logState.globalFilter = filterInput.value; saveLocalLogConfig(); renderLog();
+      });
+      colsBtn.addEventListener('click', (e) => { e.stopPropagation(); toggleLogMenu('log-cols-menu', renderColumnsMenu); });
+      viewsBtn.addEventListener('click', (e) => { e.stopPropagation(); toggleLogMenu('log-views-menu', renderViewsMenu); });
+      document.removeEventListener('click', closeLogMenus);
+      document.addEventListener('click', closeLogMenus);
 
       highlightActiveFile();
       updateNavButtons();
@@ -3080,7 +3558,19 @@ const indexHTML = `<!DOCTYPE html>
         window.history.pushState({ file: activeFile, sidebar: !sidebarHidden }, '', url);
       }
 
+      loadLogViews();
       await fetchLog(true);
+    }
+
+    function toggleLogMenu(menuId, renderFn) {
+      const menu = document.getElementById(menuId);
+      if (!menu) return;
+      const wasHidden = menu.classList.contains('hidden');
+      closeLogMenus();
+      if (wasHidden) { renderFn(); menu.classList.remove('hidden'); }
+    }
+    function closeLogMenus() {
+      document.querySelectorAll('.log-menu').forEach(m => m.classList.add('hidden'));
     }
 
     async function fetchLog(initial) {
@@ -3091,23 +3581,20 @@ const indexHTML = `<!DOCTYPE html>
         const resp = await fetch(url);
         if (!resp.ok) throw new Error('failed');
         const data = await resp.json();
-        // Ignore late responses if the user switched files.
         if (!logState || logState.path !== activeFile) return;
 
         if (initial || (data.truncated && data.offset <= logState.offset)) {
-          // Fresh / rotated / cleared content replaces what we had.
           logState.buffer = data.content;
         } else if (data.content) {
           logState.buffer += data.content;
         }
-        // Cap buffer growth during long-running tails (keep the most recent tail).
         const MAX_BUF = 5 << 20;
         if (logState.buffer.length > MAX_BUF) {
           const cut = logState.buffer.indexOf('\n', logState.buffer.length - MAX_BUF);
           logState.buffer = logState.buffer.slice(cut >= 0 ? cut + 1 : logState.buffer.length - MAX_BUF);
         }
         logState.offset = data.offset;
-        renderLog();
+        if (!logState.resizing) renderLog();
       } catch (e) {
         const stat = document.getElementById('log-stat');
         if (stat) stat.textContent = 'fetch error';
@@ -3123,6 +3610,7 @@ const indexHTML = `<!DOCTYPE html>
         liveBtn.classList.remove('log-live-on');
       } else {
         logState.live = true;
+        logState.stick = true;
         liveBtn.textContent = '⏸ Live (on)';
         liveBtn.classList.add('log-live-on');
         logState.timer = setInterval(() => fetchLog(false), 1500);
@@ -3137,6 +3625,7 @@ const indexHTML = `<!DOCTYPE html>
         if (!resp.ok) throw new Error('failed');
         logState.buffer = '';
         logState.offset = 0;
+        logState.stick = true;
         renderLog();
       } catch (e) {
         alert('Failed to clear log file.');
@@ -3149,37 +3638,83 @@ const indexHTML = `<!DOCTYPE html>
       try { const v = JSON.parse(t); return (v && typeof v === 'object') ? v : null; } catch (e) { return null; }
     }
 
+    function logLines() {
+      const lines = logState.buffer.split('\n');
+      if (lines.length && lines[lines.length - 1] === '') lines.pop();
+      return lines;
+    }
+
+    // Update logState.allCols with any newly-seen JSON keys, preserving order.
+    function discoverColumns(parsedObjs) {
+      const have = new Set(logState.allCols);
+      if (logState.allCols.length === 0) {
+        LOG_PREFERRED_COLS.forEach(k => {
+          if (parsedObjs.some(o => k in o) && !have.has(k)) { logState.allCols.push(k); have.add(k); }
+        });
+      }
+      parsedObjs.forEach(o => Object.keys(o).forEach(k => {
+        if (!have.has(k)) { logState.allCols.push(k); have.add(k); }
+      }));
+    }
+
+    function orderedColumns() {
+      const c = logState.colConfig;
+      const known = new Set(logState.allCols);
+      const ordered = [];
+      const placed = new Set();
+      (c.order || []).forEach(k => { if (known.has(k) && !placed.has(k)) { ordered.push(k); placed.add(k); } });
+      logState.allCols.forEach(k => { if (!placed.has(k)) { ordered.push(k); placed.add(k); } });
+      return ordered;
+    }
+    function visibleColumns() {
+      return orderedColumns().filter(k => !logState.colConfig.hidden[k]);
+    }
+
     function renderLog() {
       if (!logState) return;
       const body = document.getElementById('log-body');
-      const stat = document.getElementById('log-stat');
       if (!body) return;
 
-      const filter = logState.filter.trim().toLowerCase();
-      let allLines = logState.buffer.split('\n');
-      if (allLines.length && allLines[allLines.length - 1] === '') allLines.pop();
-      const shown = filter
-        ? allLines.filter(l => l.toLowerCase().includes(filter))
-        : allLines;
-
-      if (stat) {
-        stat.textContent = shown.length + (filter ? ' / ' + allLines.length : '') + ' lines';
-      }
-
+      // Preserve scroll position & focused filter input across re-render.
       const prevScroller = body.querySelector('.log-output, .log-table-wrap');
-      const atBottom = prevScroller
-        ? (prevScroller.scrollTop + prevScroller.clientHeight >= prevScroller.scrollHeight - 40) : true;
+      const prevTop = prevScroller ? prevScroller.scrollTop : 0;
+      const active = document.activeElement;
+      let focusInfo = null;
+      if (active && active.classList && active.classList.contains('log-col-filter')) {
+        focusInfo = { col: active.dataset.col, start: active.selectionStart, end: active.selectionEnd };
+      }
 
       if (logState.jsonMode) {
-        renderLogTable(body, shown, filter);
+        renderLogTable(body);
       } else {
-        renderLogRaw(body, shown, filter);
+        renderLogRaw(body);
       }
 
-      if (logState.live || atBottom) {
-        const scroller = body.querySelector('.log-output, .log-table-wrap');
-        if (scroller) scroller.scrollTop = scroller.scrollHeight;
+      const scroller = body.querySelector('.log-output, .log-table-wrap');
+      if (scroller) {
+        if (logState.stick) {
+          scroller.scrollTop = scroller.scrollHeight;
+        } else {
+          scroller.scrollTop = prevTop;
+        }
+        scroller.addEventListener('scroll', onLogScroll);
       }
+      if (focusInfo) {
+        const inp = body.querySelector('.log-col-filter[data-col="' + cssAttr(focusInfo.col) + '"]');
+        if (inp) { inp.focus(); try { inp.setSelectionRange(focusInfo.start, focusInfo.end); } catch (e) {} }
+      }
+    }
+
+    function cssAttr(s) { return String(s).replace(/"/g, '\\"'); }
+
+    function onLogScroll(e) {
+      const el = e.currentTarget;
+      logState.stick = (el.scrollTop + el.clientHeight >= el.scrollHeight - 40);
+    }
+
+    function updateLogStat(shownCount, total) {
+      const stat = document.getElementById('log-stat');
+      if (stat) stat.textContent = shownCount + (shownCount !== total ? ' / ' + total : '') + ' lines';
     }
 
     function highlightFilter(text, filter) {
@@ -3193,7 +3728,11 @@ const indexHTML = `<!DOCTYPE html>
         escapeHtml(text.slice(end));
     }
 
-    function renderLogRaw(body, shown, filter) {
+    function renderLogRaw(body) {
+      const filter = logState.globalFilter.trim().toLowerCase();
+      const all = logLines();
+      const shown = filter ? all.filter(l => l.toLowerCase().includes(filter)) : all;
+      updateLogStat(shown.length, all.length);
       if (!shown.length) {
         body.innerHTML = '<div class="muted" style="padding:12px;">No log lines' + (filter ? ' match the filter.' : '.') + '</div>';
         return;
@@ -3213,50 +3752,233 @@ const indexHTML = `<!DOCTYPE html>
       return escapeHtml(String(val));
     }
 
-    function renderLogTable(body, shown, filter) {
-      const rows = shown.map(l => ({ raw: l, obj: tryParseJson(l) }));
-      const parsed = rows.filter(r => r.obj);
-      if (!parsed.length) {
-        renderLogRaw(body, shown, filter);
-        return;
-      }
+    function cellString(v) {
+      if (v === null || v === undefined) return '';
+      if (typeof v === 'object') return JSON.stringify(v);
+      return String(v);
+    }
 
-      // Build an ordered column set: well-known fields first, then the rest.
-      const preferred = ['time','timestamp','ts','date','level','lvl','severity','logger','name','msg','message'];
-      const seen = new Set();
-      const cols = [];
-      preferred.forEach(k => {
-        if (parsed.some(r => k in r.obj)) { cols.push(k); seen.add(k); }
+    function renderLogTable(body) {
+      const globalFilter = logState.globalFilter.trim().toLowerCase();
+      const all = logLines();
+      const rows = all.map(l => ({ raw: l, obj: tryParseJson(l) }));
+      const parsedObjs = rows.filter(r => r.obj).map(r => r.obj);
+      if (!parsedObjs.length) { renderLogRaw(body); return; }
+
+      discoverColumns(parsedObjs);
+      const cols = visibleColumns();
+      const c = logState.colConfig;
+
+      const colFilters = Object.keys(c.filters).filter(k => (c.filters[k] || '').trim() !== '');
+      const anyColFilter = colFilters.length > 0;
+
+      const shown = rows.filter(r => {
+        if (globalFilter && !r.raw.toLowerCase().includes(globalFilter)) return false;
+        if (!anyColFilter) return true;
+        if (!r.obj) return false; // column filters exclude non-JSON lines
+        return colFilters.every(k => cellString(r.obj[k]).toLowerCase().includes(c.filters[k].trim().toLowerCase()));
       });
-      parsed.forEach(r => Object.keys(r.obj).forEach(k => {
-        if (!seen.has(k)) { seen.add(k); cols.push(k); }
-      }));
+      updateLogStat(shown.length, all.length);
 
-      const levelKeys = new Set(['level','lvl','severity']);
-      let html = '<div class="log-table-wrap"><table class="log-table"><thead><tr>';
-      cols.forEach(c => { html += '<th>' + escapeHtml(c) + '</th>'; });
+      let html = '<div class="log-table-wrap"><table class="log-table"><colgroup>';
+      cols.forEach(k => {
+        const w = c.widths[k] || logColDefaultWidth(k);
+        html += '<col style="width:' + w + 'px">';
+      });
+      html += '</colgroup><thead><tr>';
+      cols.forEach(k => {
+        html += '<th data-col="' + escapeHtml(k) + '"><span class="log-th-label" title="' + escapeHtml(k) + '">' +
+          escapeHtml(k) + '</span><span class="log-col-resizer" data-col="' + escapeHtml(k) + '"></span></th>';
+      });
+      html += '</tr><tr class="log-filter-row">';
+      cols.forEach(k => {
+        const val = c.filters[k] || '';
+        html += '<th><input class="log-col-filter" data-col="' + escapeHtml(k) +
+          '" type="text" placeholder="filter…" value="' + escapeHtml(val) + '"></th>';
+      });
       html += '</tr></thead><tbody>';
 
-      rows.forEach(r => {
+      shown.forEach(r => {
         if (!r.obj) {
-          html += '<tr class="log-raw-row"><td colspan="' + cols.length + '">' + highlightFilter(r.raw, filter) + '</td></tr>';
+          html += '<tr class="log-raw-row"><td colspan="' + cols.length + '">' + highlightFilter(r.raw, globalFilter) + '</td></tr>';
           return;
         }
         html += '<tr>';
-        cols.forEach(c => {
-          if (!(c in r.obj)) { html += '<td></td>'; return; }
-          let v = r.obj[c];
-          if (v !== null && typeof v === 'object') v = JSON.stringify(v);
-          if (levelKeys.has(c)) {
-            html += '<td>' + levelBadge(v) + '</td>';
-          } else {
-            html += '<td>' + highlightFilter(String(v), filter) + '</td>';
-          }
+        cols.forEach(k => {
+          if (!(k in r.obj)) { html += '<td></td>'; return; }
+          const v = cellString(r.obj[k]);
+          const hl = (c.filters[k] || '').trim().toLowerCase() || globalFilter;
+          if (LOG_LEVEL_KEYS.has(k.toLowerCase())) html += '<td>' + levelBadge(v) + '</td>';
+          else html += '<td title="' + escapeHtml(v) + '">' + highlightFilter(v, hl) + '</td>';
         });
         html += '</tr>';
       });
       html += '</tbody></table></div>';
       body.innerHTML = html;
+
+      // Wire column filters and resizers.
+      body.querySelectorAll('.log-col-filter').forEach(inp => {
+        inp.addEventListener('input', () => {
+          logState.colConfig.filters[inp.dataset.col] = inp.value;
+          saveLocalLogConfig(); renderLog();
+        });
+      });
+      body.querySelectorAll('.log-col-resizer').forEach(rz => {
+        rz.addEventListener('mousedown', startColResize);
+      });
+    }
+
+    function startColResize(e) {
+      e.preventDefault();
+      e.stopPropagation();
+      const col = e.currentTarget.dataset.col;
+      const th = e.currentTarget.closest('th');
+      const startX = e.clientX;
+      const startW = th.getBoundingClientRect().width;
+      logState.resizing = true;
+      const colEl = th.closest('table').querySelector('colgroup col:nth-child(' +
+        (Array.prototype.indexOf.call(th.parentNode.children, th) + 1) + ')');
+      function onMove(ev) {
+        const w = Math.max(48, Math.round(startW + (ev.clientX - startX)));
+        logState.colConfig.widths[col] = w;
+        if (colEl) colEl.style.width = w + 'px';
+      }
+      function onUp() {
+        document.removeEventListener('mousemove', onMove);
+        document.removeEventListener('mouseup', onUp);
+        logState.resizing = false;
+        saveLocalLogConfig();
+      }
+      document.addEventListener('mousemove', onMove);
+      document.addEventListener('mouseup', onUp);
+    }
+
+    function renderColumnsMenu() {
+      const menu = document.getElementById('log-cols-menu');
+      const cols = orderedColumns();
+      if (!cols.length) { menu.innerHTML = '<div class="log-menu-empty">Enable JSON table with data to configure columns.</div>'; return; }
+      let html = '<div class="log-menu-title">Visible columns</div>';
+      cols.forEach(k => {
+        const checked = logState.colConfig.hidden[k] ? '' : 'checked';
+        html += '<label class="log-menu-row"><input type="checkbox" data-col="' + escapeHtml(k) + '" ' + checked + '> ' + escapeHtml(k) + '</label>';
+      });
+      html += '<div class="log-menu-actions"><button class="btn" id="log-cols-reset" type="button">Reset</button></div>';
+      menu.innerHTML = html;
+      menu.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+        cb.addEventListener('change', () => {
+          logState.colConfig.hidden[cb.dataset.col] = !cb.checked;
+          saveLocalLogConfig(); renderLog();
+        });
+      });
+      menu.querySelector('#log-cols-reset').addEventListener('click', () => {
+        logState.colConfig.hidden = {};
+        logState.colConfig.widths = {};
+        saveLocalLogConfig(); renderColumnsMenu(); renderLog();
+      });
+    }
+
+    async function loadLogViews() {
+      try {
+        const resp = await fetch('/api/log/views?path=' + encodeURIComponent(logState.path));
+        if (!resp.ok) return;
+        const data = await resp.json();
+        if (!logState) return;
+        logState.views = data.views || [];
+      } catch (e) {}
+    }
+
+    function renderViewsMenu() {
+      const menu = document.getElementById('log-views-menu');
+      let html = '<div class="log-menu-title">Saved views</div>';
+      if (!logState.views.length) {
+        html += '<div class="log-menu-empty">No views yet.</div>';
+      } else {
+        logState.views.forEach(v => {
+          const active = v.name === logState.currentView ? ' log-view-active' : '';
+          const scope = v.dir ? v.dir + '/' : 'root';
+          html += '<div class="log-menu-row log-view-row' + active + '">' +
+            '<span class="log-view-apply" data-name="' + escapeHtml(v.name) + '">' + escapeHtml(v.name) +
+            ' <span class="log-view-scope">' + escapeHtml(scope) + '</span></span>' +
+            '<span class="log-view-del" data-name="' + escapeHtml(v.name) + '" title="Delete view">×</span></div>';
+        });
+      }
+      html += '<div class="log-menu-actions">' +
+        '<button class="btn" id="log-view-save" type="button">💾 Save current as view…</button>' +
+        (logState.currentView ? '<button class="btn" id="log-view-clear" type="button">Clear</button>' : '') +
+        '</div>';
+      menu.innerHTML = html;
+
+      menu.querySelectorAll('.log-view-apply').forEach(el => {
+        el.addEventListener('click', () => applyLogView(el.dataset.name));
+      });
+      menu.querySelectorAll('.log-view-del').forEach(el => {
+        el.addEventListener('click', (e) => { e.stopPropagation(); deleteLogView(el.dataset.name); });
+      });
+      menu.querySelector('#log-view-save').addEventListener('click', saveLogView);
+      const clr = menu.querySelector('#log-view-clear');
+      if (clr) clr.addEventListener('click', () => {
+        logState.currentView = '';
+        updateViewNameLabel();
+        renderViewsMenu();
+      });
+    }
+
+    function updateViewNameLabel() {
+      const el = document.getElementById('log-view-name');
+      if (el) el.textContent = logState.currentView ? ('view: ' + logState.currentView) : '';
+    }
+
+    function applyLogView(name) {
+      const v = logState.views.find(x => x.name === name);
+      if (!v) return;
+      applyLogConfig(v.config || {});
+      logState.currentView = name;
+      const jsonToggle = document.getElementById('log-json-toggle');
+      const filterInput = document.getElementById('log-filter');
+      const colsBtn = document.getElementById('log-cols-btn');
+      if (jsonToggle) jsonToggle.checked = logState.jsonMode;
+      if (filterInput) filterInput.value = logState.globalFilter;
+      if (colsBtn) colsBtn.classList.toggle('hidden', !logState.jsonMode);
+      saveLocalLogConfig();
+      updateViewNameLabel();
+      closeLogMenus();
+      renderLog();
+    }
+
+    async function saveLogView() {
+      const name = prompt('Save view as (available to this folder and subfolders):', logState.currentView || '');
+      if (!name || !name.trim()) return;
+      try {
+        const resp = await fetch('/api/log/views/save?path=' + encodeURIComponent(logState.path), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: name.trim(), config: captureLogConfig() })
+        });
+        if (!resp.ok) throw new Error('failed');
+        logState.currentView = name.trim();
+        updateViewNameLabel();
+        await loadLogViews();
+        renderViewsMenu();
+      } catch (e) {
+        alert('Failed to save view.');
+      }
+    }
+
+    async function deleteLogView(name) {
+      if (!confirm('Delete view "' + name + '"?')) return;
+      try {
+        const resp = await fetch('/api/log/views/delete?path=' + encodeURIComponent(logState.path), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: name })
+        });
+        if (!resp.ok) throw new Error('failed');
+        if (logState.currentView === name) { logState.currentView = ''; updateViewNameLabel(); }
+        await loadLogViews();
+        renderViewsMenu();
+      } catch (e) {
+        alert('Failed to delete view.');
+      }
     }
 
     function renderMarkdown(markdown) {

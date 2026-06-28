@@ -96,17 +96,24 @@ The sidebar **live-updates** every 5 seconds — new files, deletions, and modif
 
 Open any `.log`, `.jsonl`, or `.ndjson` file from the sidebar to get a dedicated log viewer:
 
-- **Live Tail** — toggle to continuously poll the file (every 1.5s) and auto-scroll as new lines arrive.
+- **Live Tail** — toggle to continuously poll the file (every 1.5s) and stream new lines. Auto-scroll follows the tail **only while you are at the bottom**; if you scroll up to inspect older lines, it stays put.
 - **Clear** — truncate the log file to zero length to easily see only the latest output.
-- **JSON table** — when lines are JSON objects (one per line), render them as a sortable-looking table with columns inferred from the keys. Common fields (`time`, `level`, `msg`, …) are ordered first and `level`/`severity` values get colored badges. Non-JSON lines fall back to raw text.
-- **Filter** — type a case-insensitive substring to show only matching lines (works in both raw and table modes), with matches highlighted.
+- **JSON table** — when lines are JSON objects (one per line), render them as a table with columns inferred from the keys. Common fields (`time`, `level`, `msg`, …) are ordered first and `level`/`severity` values get colored badges. Non-JSON lines fall back to raw rows.
+  - **Resizable columns** — drag a column's right edge to resize. Widths are remembered per file.
+  - **Hide columns** — use the **⚙ Columns** menu to toggle column visibility (or **Reset**).
+  - **Per-column filters** — each column has its own filter box; combine them (AND) with the global filter. Matches are highlighted.
+- **Filter all** — top-level case-insensitive substring filter across the whole line (works in raw and table modes).
+- **🔖 Views** — Notion-like saved views bundling the filter + column configuration (visibility, widths, order, per-column filters). Saved views are stored in a `.mdviewer` file in the log's folder and are **available to that folder and all subfolders**. A view saved deeper in the tree overrides a same-named ancestor.
 
-Only the most recent ~2 MB of a large log is loaded initially; live tailing then streams new bytes incrementally and detects truncation/rotation.
+Column configuration is also auto-saved to `localStorage` per file, so reopening a log restores your last layout. Only the most recent ~2 MB of a large log is loaded initially; live tailing then streams new bytes incrementally and detects truncation/rotation.
 
 ### Log API
 
 - `GET /api/log?path=<rel>&offset=<n>` returns new bytes since `offset` (omit `offset` for the initial tail). Response: `{ content, offset, size, truncated }`.
 - `POST /api/log/clear?path=<rel>` truncates the log file.
+- `GET /api/log/views?path=<rel>` lists saved views applicable to the log (own folder + ancestors up to root).
+- `POST /api/log/views/save?path=<rel>` body `{ name, config }` — upserts a view in the log folder's `.mdviewer`.
+- `POST /api/log/views/delete?path=<rel>` body `{ name }` — removes a view (searched deepest-first).
 
 ## Options
 
@@ -114,10 +121,14 @@ Only the most recent ~2 MB of a large log is loaded initially; live tailing then
 - `-port` (default `8080`): HTTP port to listen on.
 - `-podcast-watch` (optional): Comma-separated list of directories and/or glob patterns to watch for auto podcast generation.
 - `-version`: Print the version and exit.
+- `-update`: Download the latest release binary for your platform from GitHub and replace the running executable in place, then exit.
 
 ```bash
 mdviewer -version
-# mdviewer v1.12.0
+# mdviewer v1.15.0
+
+# Self-update to the latest GitHub release
+mdviewer -update
 ```
 
 ### Auto Podcast Generation (`-podcast-watch`)
