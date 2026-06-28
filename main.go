@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -239,6 +240,8 @@ func main() {
 	mux.HandleFunc("/", a.handleIndex)
 	mux.HandleFunc("/api/files", a.handleFiles)
 	mux.HandleFunc("/api/file", a.handleFile)
+	mux.HandleFunc("/api/log", a.handleLogTail)
+	mux.HandleFunc("/api/log/clear", a.handleLogClear)
 	mux.HandleFunc("/api/search", a.handleSearch)
 	mux.HandleFunc("/api/tags", a.handleTags)
 	mux.HandleFunc("/api/tag", a.handleSetTag)
@@ -389,6 +392,147 @@ func (a *app) handleFile(w http.ResponseWriter, r *http.Request) {
 type searchResult struct {
 	Path    string `json:"path"`
 	Context string `json:"context"`
+}
+
+// maxLogInitialBytes caps the initial log payload so opening a huge log file
+// only loads the most recent tail rather than the entire file.
+const maxLogInitialBytes = 2 << 20 // 2 MiB
+
+// handleLogTail streams new bytes from a log file. With no offset (or a
+// negative one) it returns the tail of the file (capped to maxLogInitialBytes)
+// and the current size as the next offset. With an offset it returns only the
+// bytes written since that offset, detecting truncation/rotation.
+func (a *app) handleLogTail(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	relPath, err := sanitizeRelativePath(r.URL.Query().Get("path"))
+	if err != nil {
+		http.Error(w, "invalid path", http.StatusBadRequest)
+		return
+	}
+	if !isLogFile(relPath) {
+		http.Error(w, "only log files are supported", http.StatusBadRequest)
+		return
+	}
+
+	fullPath, err := secureJoin(a.root, relPath)
+	if err != nil {
+		http.Error(w, "invalid path", http.StatusBadRequest)
+		return
+	}
+
+	f, err := os.Open(fullPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			http.Error(w, "file not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, "failed to read file", http.StatusInternalServerError)
+		return
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		http.Error(w, "failed to read file", http.StatusInternalServerError)
+		return
+	}
+	size := info.Size()
+
+	offset := int64(-1)
+	hasOffset := false
+	if raw := r.URL.Query().Get("offset"); raw != "" {
+		if v, perr := strconv.ParseInt(raw, 10, 64); perr == nil {
+			offset = v
+			hasOffset = true
+		}
+	}
+
+	truncated := false
+	var start int64
+	switch {
+	case !hasOffset || offset < 0:
+		// Initial load: return the tail capped to maxLogInitialBytes.
+		if size > maxLogInitialBytes {
+			start = size - maxLogInitialBytes
+			truncated = true // indicates content was clipped from the front
+		}
+	case offset > size:
+		// File shrank (cleared/rotated) — re-read from the beginning.
+		start = 0
+		truncated = true
+	default:
+		start = offset
+	}
+
+	var content []byte
+	if start < size {
+		if _, err := f.Seek(start, io.SeekStart); err != nil {
+			http.Error(w, "failed to read file", http.StatusInternalServerError)
+			return
+		}
+		buf := make([]byte, size-start)
+		n, rerr := io.ReadFull(f, buf)
+		if rerr != nil && rerr != io.ErrUnexpectedEOF && rerr != io.EOF {
+			http.Error(w, "failed to read file", http.StatusInternalServerError)
+			return
+		}
+		content = buf[:n]
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(struct {
+		Path      string `json:"path"`
+		Content   string `json:"content"`
+		Offset    int64  `json:"offset"`
+		Size      int64  `json:"size"`
+		Truncated bool   `json:"truncated"`
+	}{
+		Path:      relPath,
+		Content:   string(content),
+		Offset:    size,
+		Size:      size,
+		Truncated: truncated,
+	})
+}
+
+// handleLogClear truncates a log file to zero length.
+func (a *app) handleLogClear(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	relPath, err := sanitizeRelativePath(r.URL.Query().Get("path"))
+	if err != nil {
+		http.Error(w, "invalid path", http.StatusBadRequest)
+		return
+	}
+	if !isLogFile(relPath) {
+		http.Error(w, "only log files are supported", http.StatusBadRequest)
+		return
+	}
+
+	fullPath, err := secureJoin(a.root, relPath)
+	if err != nil {
+		http.Error(w, "invalid path", http.StatusBadRequest)
+		return
+	}
+
+	if err := os.Truncate(fullPath, 0); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			http.Error(w, "file not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, "failed to clear file", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true})
 }
 
 func (a *app) handleSearch(w http.ResponseWriter, r *http.Request) {
@@ -1202,10 +1346,20 @@ func isImageFile(path string) bool {
 	}
 }
 
+// isLogFile reports whether the file is a log file that can be live-tailed.
+func isLogFile(path string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".log", ".jsonl", ".ndjson":
+		return true
+	default:
+		return false
+	}
+}
+
 // isViewableFile reports whether the file can be shown in the viewer sidebar
-// and content area: markdown, PDF, HTML, or image files.
+// and content area: markdown, PDF, HTML, image, or log files.
 func isViewableFile(path string) bool {
-	return isMarkdownFile(path) || isPDFFile(path) || isHTMLFile(path) || isImageFile(path)
+	return isMarkdownFile(path) || isPDFFile(path) || isHTMLFile(path) || isImageFile(path) || isLogFile(path)
 }
 
 func sanitizeRelativePath(path string) (string, error) {
@@ -2020,6 +2174,42 @@ const indexHTML = `<!DOCTYPE html>
       /* Shrink buttons a bit */
       .btn { padding: 5px 8px; font-size: 12px; }
     }
+
+    /* --- Log viewer --- */
+    .log-toolbar {
+      display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+      padding: 8px 0; margin-bottom: 8px;
+      border-bottom: 1px solid var(--border); position: sticky; top: 0;
+      background: var(--bg); z-index: 5;
+    }
+    .log-toolbar input.log-filter {
+      flex: 1; min-width: 160px; padding: 6px 10px;
+      border: 1px solid var(--border); border-radius: 6px;
+      background: var(--bg); color: var(--fg); font-size: 13px;
+    }
+    .log-toolbar .log-stat { font-size: 12px; color: var(--muted); white-space: nowrap; }
+    .log-live-on { background: #238636 !important; border-color: #238636 !important; color: #fff !important; }
+    .log-output {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12.5px; line-height: 1.5; white-space: pre-wrap; word-break: break-word;
+      margin: 0; max-height: calc(100vh - 220px); overflow: auto;
+      background: var(--code-bg, rgba(127,127,127,0.08)); border-radius: 6px; padding: 10px;
+    }
+    .log-line.log-hit { background: rgba(255, 221, 0, 0.18); }
+    .log-table-wrap { max-height: calc(100vh - 220px); overflow: auto; border: 1px solid var(--border); border-radius: 6px; }
+    table.log-table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
+    table.log-table th, table.log-table td {
+      border: 1px solid var(--border); padding: 4px 8px; text-align: left;
+      vertical-align: top; font-family: ui-monospace, Menlo, Consolas, monospace;
+      max-width: 480px; overflow-wrap: anywhere;
+    }
+    table.log-table th { position: sticky; top: 0; background: var(--bg); z-index: 2; cursor: default; }
+    table.log-table tr.log-raw-row td { font-style: italic; color: var(--muted); }
+    .log-badge { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 11px; font-weight: 600; color: #fff; }
+    .log-lvl-error, .log-lvl-fatal, .log-lvl-critical { background: #e74c3c; }
+    .log-lvl-warn, .log-lvl-warning { background: #e67e22; }
+    .log-lvl-info { background: #3498db; }
+    .log-lvl-debug, .log-lvl-trace { background: #7f8c8d; }
   </style>
 </head>
 <body>
@@ -2106,6 +2296,8 @@ const indexHTML = `<!DOCTYPE html>
     function isPdfPath(p) { return p.toLowerCase().endsWith('.pdf'); }
     function isHtmlPath(p) { const l = p.toLowerCase(); return l.endsWith('.html') || l.endsWith('.htm'); }
     function isImagePath(p) { const l = p.toLowerCase(); return IMAGE_EXTS.some(e => l.endsWith(e)); }
+    const LOG_EXTS = ['.log', '.jsonl', '.ndjson'];
+    function isLogPath(p) { const l = p.toLowerCase(); return LOG_EXTS.some(e => l.endsWith(e)); }
     function isMarkdownPath(p) { const l = p.toLowerCase(); return l.endsWith('.md') || l.endsWith('.markdown'); }
     function mediaUrlFor(p) { return '/api/media/' + p.split('/').map(s => encodeURIComponent(s)).join('/'); }
 
@@ -2586,7 +2778,8 @@ const indexHTML = `<!DOCTYPE html>
         const isPDF = isPdfPath(file.path);
         const isHTML = isHtmlPath(file.path);
         const isImage = isImagePath(file.path);
-        const isViewerOnly = isPDF || isHTML || isImage;
+        const isLog = isLogPath(file.path);
+        const isViewerOnly = isPDF || isHTML || isImage || isLog;
         if (isPDF) {
           icon.innerHTML = '&#128196;'; // page
           icon.style.color = '#e74c3c';
@@ -2596,6 +2789,9 @@ const indexHTML = `<!DOCTYPE html>
         } else if (isImage) {
           icon.innerHTML = '&#128247;'; // camera
           icon.style.color = '#3498db';
+        } else if (isLog) {
+          icon.innerHTML = '&#128220;'; // scroll
+          icon.style.color = '#27ae60';
         } else {
           icon.innerHTML = '&#128462;';
         }
@@ -2696,12 +2892,18 @@ const indexHTML = `<!DOCTYPE html>
 
     async function openFile(filePath, pushState, searchQuery) {
       try {
+        stopLogTail();
         // Force exit raw/edit mode before rendering anything
         if (showingRaw) {
           showingRaw = false;
           renderedEl.classList.remove('hidden');
           rawContainerEl.classList.add('hidden');
           toggleRawBtn.textContent = 'Show Raw';
+        }
+
+        if (isLogPath(filePath)) {
+          await openLogFile(filePath, pushState);
+          return;
         }
 
         if (isPdfPath(filePath) || isHtmlPath(filePath) || isImagePath(filePath)) {
@@ -2813,6 +3015,248 @@ const indexHTML = `<!DOCTYPE html>
       } catch (err) {
         renderedEl.innerHTML = '<div class="muted">Failed to load markdown file.</div>';
       }
+    }
+
+    // --- Log viewer (live tail, clear, JSON-as-table, filtering) ---
+    let logState = null;
+
+    function stopLogTail() {
+      if (logState && logState.timer) {
+        clearInterval(logState.timer);
+        logState.timer = null;
+      }
+      if (logState) logState.live = false;
+    }
+
+    function escapeHtml(s) {
+      return String(s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    }
+
+    async function openLogFile(filePath, pushState) {
+      stopLogTail();
+      activeFile = filePath;
+      rawContent = '';
+      fileNameEl.textContent = activeFile;
+      document.title = filePath.split('/').pop() + ' - Log Viewer';
+      toggleRawBtn.classList.add('hidden');
+
+      logState = { path: filePath, offset: -1, buffer: '', live: false, timer: null, jsonMode: false, filter: '' };
+
+      renderedEl.innerHTML =
+        '<div class="log-toolbar">' +
+          '<button id="log-live-btn" class="btn" type="button" title="Continuously fetch new log lines">▶ Live Tail</button>' +
+          '<button id="log-clear-btn" class="btn" type="button" title="Truncate this log file">🗑 Clear</button>' +
+          '<label style="display:flex;align-items:center;gap:5px;font-size:12px;color:var(--muted);">' +
+            '<input type="checkbox" id="log-json-toggle"> JSON table' +
+          '</label>' +
+          '<input type="text" id="log-filter" class="log-filter" placeholder="Filter (substring, case-insensitive)…">' +
+          '<span id="log-stat" class="log-stat"></span>' +
+        '</div>' +
+        '<div id="log-body"></div>';
+
+      const liveBtn = document.getElementById('log-live-btn');
+      const clearBtn = document.getElementById('log-clear-btn');
+      const jsonToggle = document.getElementById('log-json-toggle');
+      const filterInput = document.getElementById('log-filter');
+
+      liveBtn.addEventListener('click', () => toggleLogLive());
+      clearBtn.addEventListener('click', () => clearLog());
+      jsonToggle.addEventListener('change', () => { logState.jsonMode = jsonToggle.checked; renderLog(); });
+      filterInput.addEventListener('input', () => { logState.filter = filterInput.value; renderLog(); });
+
+      highlightActiveFile();
+      updateNavButtons();
+      renderHeaderTags();
+      if (window.innerWidth <= 768 && !sidebarHidden) applySidebarVisibility(true, false);
+
+      if (pushState) {
+        const url = new URL(window.location.href);
+        url.searchParams.set('file', activeFile);
+        if (baseFolderPath) url.searchParams.set('baseFolderPath', baseFolderPath);
+        url.searchParams.set('sidebar', sidebarHidden ? '0' : '1');
+        url.searchParams.delete('fullscreen');
+        window.history.pushState({ file: activeFile, sidebar: !sidebarHidden }, '', url);
+      }
+
+      await fetchLog(true);
+    }
+
+    async function fetchLog(initial) {
+      if (!logState) return;
+      try {
+        let url = '/api/log?path=' + encodeURIComponent(logState.path);
+        if (!initial) url += '&offset=' + logState.offset;
+        const resp = await fetch(url);
+        if (!resp.ok) throw new Error('failed');
+        const data = await resp.json();
+        // Ignore late responses if the user switched files.
+        if (!logState || logState.path !== activeFile) return;
+
+        if (initial || (data.truncated && data.offset <= logState.offset)) {
+          // Fresh / rotated / cleared content replaces what we had.
+          logState.buffer = data.content;
+        } else if (data.content) {
+          logState.buffer += data.content;
+        }
+        // Cap buffer growth during long-running tails (keep the most recent tail).
+        const MAX_BUF = 5 << 20;
+        if (logState.buffer.length > MAX_BUF) {
+          const cut = logState.buffer.indexOf('\n', logState.buffer.length - MAX_BUF);
+          logState.buffer = logState.buffer.slice(cut >= 0 ? cut + 1 : logState.buffer.length - MAX_BUF);
+        }
+        logState.offset = data.offset;
+        renderLog();
+      } catch (e) {
+        const stat = document.getElementById('log-stat');
+        if (stat) stat.textContent = 'fetch error';
+      }
+    }
+
+    function toggleLogLive() {
+      if (!logState) return;
+      const liveBtn = document.getElementById('log-live-btn');
+      if (logState.live) {
+        stopLogTail();
+        liveBtn.textContent = '▶ Live Tail';
+        liveBtn.classList.remove('log-live-on');
+      } else {
+        logState.live = true;
+        liveBtn.textContent = '⏸ Live (on)';
+        liveBtn.classList.add('log-live-on');
+        logState.timer = setInterval(() => fetchLog(false), 1500);
+      }
+    }
+
+    async function clearLog() {
+      if (!logState) return;
+      if (!confirm('Clear (truncate) this log file? This cannot be undone.')) return;
+      try {
+        const resp = await fetch('/api/log/clear?path=' + encodeURIComponent(logState.path), { method: 'POST' });
+        if (!resp.ok) throw new Error('failed');
+        logState.buffer = '';
+        logState.offset = 0;
+        renderLog();
+      } catch (e) {
+        alert('Failed to clear log file.');
+      }
+    }
+
+    function tryParseJson(line) {
+      const t = line.trim();
+      if (!t || (t[0] !== '{' && t[0] !== '[')) return null;
+      try { const v = JSON.parse(t); return (v && typeof v === 'object') ? v : null; } catch (e) { return null; }
+    }
+
+    function renderLog() {
+      if (!logState) return;
+      const body = document.getElementById('log-body');
+      const stat = document.getElementById('log-stat');
+      if (!body) return;
+
+      const filter = logState.filter.trim().toLowerCase();
+      let allLines = logState.buffer.split('\n');
+      if (allLines.length && allLines[allLines.length - 1] === '') allLines.pop();
+      const shown = filter
+        ? allLines.filter(l => l.toLowerCase().includes(filter))
+        : allLines;
+
+      if (stat) {
+        stat.textContent = shown.length + (filter ? ' / ' + allLines.length : '') + ' lines';
+      }
+
+      const prevScroller = body.querySelector('.log-output, .log-table-wrap');
+      const atBottom = prevScroller
+        ? (prevScroller.scrollTop + prevScroller.clientHeight >= prevScroller.scrollHeight - 40) : true;
+
+      if (logState.jsonMode) {
+        renderLogTable(body, shown, filter);
+      } else {
+        renderLogRaw(body, shown, filter);
+      }
+
+      if (logState.live || atBottom) {
+        const scroller = body.querySelector('.log-output, .log-table-wrap');
+        if (scroller) scroller.scrollTop = scroller.scrollHeight;
+      }
+    }
+
+    function highlightFilter(text, filter) {
+      const esc = escapeHtml(text);
+      if (!filter) return esc;
+      const idx = text.toLowerCase().indexOf(filter);
+      if (idx < 0) return esc;
+      const end = idx + filter.length;
+      return escapeHtml(text.slice(0, idx)) +
+        '<mark class="search-highlight">' + escapeHtml(text.slice(idx, end)) + '</mark>' +
+        escapeHtml(text.slice(end));
+    }
+
+    function renderLogRaw(body, shown, filter) {
+      if (!shown.length) {
+        body.innerHTML = '<div class="muted" style="padding:12px;">No log lines' + (filter ? ' match the filter.' : '.') + '</div>';
+        return;
+      }
+      const html = shown.map(l =>
+        '<div class="log-line' + (filter ? ' log-hit' : '') + '">' + highlightFilter(l, filter) + '</div>'
+      ).join('');
+      body.innerHTML = '<pre class="log-output">' + html + '</pre>';
+    }
+
+    function levelBadge(val) {
+      const lvl = String(val).toLowerCase().trim();
+      const known = ['error','fatal','critical','warn','warning','info','debug','trace'];
+      if (known.includes(lvl)) {
+        return '<span class="log-badge log-lvl-' + lvl + '">' + escapeHtml(String(val)) + '</span>';
+      }
+      return escapeHtml(String(val));
+    }
+
+    function renderLogTable(body, shown, filter) {
+      const rows = shown.map(l => ({ raw: l, obj: tryParseJson(l) }));
+      const parsed = rows.filter(r => r.obj);
+      if (!parsed.length) {
+        renderLogRaw(body, shown, filter);
+        return;
+      }
+
+      // Build an ordered column set: well-known fields first, then the rest.
+      const preferred = ['time','timestamp','ts','date','level','lvl','severity','logger','name','msg','message'];
+      const seen = new Set();
+      const cols = [];
+      preferred.forEach(k => {
+        if (parsed.some(r => k in r.obj)) { cols.push(k); seen.add(k); }
+      });
+      parsed.forEach(r => Object.keys(r.obj).forEach(k => {
+        if (!seen.has(k)) { seen.add(k); cols.push(k); }
+      }));
+
+      const levelKeys = new Set(['level','lvl','severity']);
+      let html = '<div class="log-table-wrap"><table class="log-table"><thead><tr>';
+      cols.forEach(c => { html += '<th>' + escapeHtml(c) + '</th>'; });
+      html += '</tr></thead><tbody>';
+
+      rows.forEach(r => {
+        if (!r.obj) {
+          html += '<tr class="log-raw-row"><td colspan="' + cols.length + '">' + highlightFilter(r.raw, filter) + '</td></tr>';
+          return;
+        }
+        html += '<tr>';
+        cols.forEach(c => {
+          if (!(c in r.obj)) { html += '<td></td>'; return; }
+          let v = r.obj[c];
+          if (v !== null && typeof v === 'object') v = JSON.stringify(v);
+          if (levelKeys.has(c)) {
+            html += '<td>' + levelBadge(v) + '</td>';
+          } else {
+            html += '<td>' + highlightFilter(String(v), filter) + '</td>';
+          }
+        });
+        html += '</tr>';
+      });
+      html += '</tbody></table></div>';
+      body.innerHTML = html;
     }
 
     function renderMarkdown(markdown) {

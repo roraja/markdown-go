@@ -1,6 +1,6 @@
 # mdviewer-go
 
-A lightweight local web app to browse and render Markdown files (`.md`, `.markdown`) from a folder. It can also view PDFs, HTML files, and images (`.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.svg`, `.bmp`, `.ico`, `.avif`) found in the same folder tree.
+A lightweight local web app to browse and render Markdown files (`.md`, `.markdown`) from a folder. It can also view PDFs, HTML files, and images (`.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.svg`, `.bmp`, `.ico`, `.avif`) found in the same folder tree. Log files (`.log`, `.jsonl`, `.ndjson`) can be **live-tailed**, cleared, filtered, and — for JSON logs — rendered as tables.
 
 ## Quick Install
 
@@ -91,6 +91,22 @@ Then run the installed binary from your Go bin directory (for example `$(go env 
 4. Use **Hide Sidebar** for full-width reading, or toggle to **Show Raw**.
 
 The sidebar **live-updates** every 5 seconds — new files, deletions, and modification time changes appear automatically without refreshing the page.
+
+## Log files
+
+Open any `.log`, `.jsonl`, or `.ndjson` file from the sidebar to get a dedicated log viewer:
+
+- **Live Tail** — toggle to continuously poll the file (every 1.5s) and auto-scroll as new lines arrive.
+- **Clear** — truncate the log file to zero length to easily see only the latest output.
+- **JSON table** — when lines are JSON objects (one per line), render them as a sortable-looking table with columns inferred from the keys. Common fields (`time`, `level`, `msg`, …) are ordered first and `level`/`severity` values get colored badges. Non-JSON lines fall back to raw text.
+- **Filter** — type a case-insensitive substring to show only matching lines (works in both raw and table modes), with matches highlighted.
+
+Only the most recent ~2 MB of a large log is loaded initially; live tailing then streams new bytes incrementally and detects truncation/rotation.
+
+### Log API
+
+- `GET /api/log?path=<rel>&offset=<n>` returns new bytes since `offset` (omit `offset` for the initial tail). Response: `{ content, offset, size, truncated }`.
+- `POST /api/log/clear?path=<rel>` truncates the log file.
 
 ## Options
 
